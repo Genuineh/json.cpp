@@ -18,3 +18,10 @@ example/*.exe
 example/*.dll
 example/*.so
 example/*.dylib
+
+# double-conversion build artifacts
+double-conversion/*.o
+double-conversion/*.a
+double-conversion/*.so
+double-conversion/*.dylib
+double-conversion/*.exe
