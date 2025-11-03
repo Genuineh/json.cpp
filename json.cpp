@@ -3004,6 +3004,34 @@ struct JsonPathNodeWithParent
     }
 };
 
+static void
+collectDescendantsWithParent(JsonPathNodeWithParent item, 
+                              std::vector<JsonPathNodeWithParent>& out)
+{
+    Json* node = item.node;
+    if (node->isArray()) {
+        auto& arr = node->getArray();
+        for (size_t i = 0; i < arr.size(); ++i) {
+            JsonPathNodeWithParent child(&arr[i]);
+            child.parent = node;
+            child.locationType = JsonPathNodeWithParent::ArrayIndex;
+            child.arrayIndex = i;
+            out.push_back(child);
+            collectDescendantsWithParent(child, out);
+        }
+    } else if (node->isObject()) {
+        auto& obj = node->getObject();
+        for (auto it = obj.begin(); it != obj.end(); ++it) {
+            JsonPathNodeWithParent child(&it->second);
+            child.parent = node;
+            child.locationType = JsonPathNodeWithParent::ObjectKey;
+            child.objectKey = it->first;
+            out.push_back(child);
+            collectDescendantsWithParent(child, out);
+        }
+    }
+}
+
 static std::vector<JsonPathNodeWithParent>
 evaluatePathWithParentInternal(Json* start,
                                 const std::vector<JsonPathStep>& steps,
@@ -3020,26 +3048,7 @@ evaluatePathWithParentInternal(Json* start,
         if (step.recursive) {
             // For recursive, collect all descendants with their parents
             for (auto& item : current) {
-                Json* node = item.node;
-                if (node->isArray()) {
-                    auto& arr = node->getArray();
-                    for (size_t i = 0; i < arr.size(); ++i) {
-                        JsonPathNodeWithParent child(&arr[i]);
-                        child.parent = node;
-                        child.locationType = JsonPathNodeWithParent::ArrayIndex;
-                        child.arrayIndex = i;
-                        base.push_back(child);
-                    }
-                } else if (node->isObject()) {
-                    auto& obj = node->getObject();
-                    for (auto it = obj.begin(); it != obj.end(); ++it) {
-                        JsonPathNodeWithParent child(&it->second);
-                        child.parent = node;
-                        child.locationType = JsonPathNodeWithParent::ObjectKey;
-                        child.objectKey = it->first;
-                        base.push_back(child);
-                    }
-                }
+                collectDescendantsWithParent(item, base);
             }
         } else {
             base = current;
