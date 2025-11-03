@@ -11,3 +11,7 @@
 example/*.o
 example/*.a
 example/json_example
+
+# double-conversion 目录的构建产物
+double-conversion/*.o
+double-conversion/*.a
