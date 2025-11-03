@@ -7,3 +7,14 @@
 /*_test
 /.aarch64
 /build
+
+# Example build artifacts
+example/*.o
+example/*.a
+example/json_example
+example/build
+example/.aarch64
+example/*.exe
+example/*.dll
+example/*.so
+example/*.dylib
