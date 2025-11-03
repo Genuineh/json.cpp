@@ -22,27 +22,28 @@ print_usage() {
 Usage: $0 [COMMAND] [OPTIONS]
 
 Commands:
-    build       Build the project (default)
-    test        Run tests
+    build       Build the project and run tests (default)
+    test        Run tests only
     clean       Clean build artifacts
     rebuild     Clean and build
-    all         Build and run tests
+    all         Build and run tests (same as build)
     example     Build example program
     help        Show this help message
 
 Options:
     --type TYPE     Build type: Debug or Release (default: Release)
     --verbose       Enable verbose output
-    --no-test       Skip tests when building
+    --no-test       Skip tests when building (only build, don't test)
 
 Examples:
-    $0                    # Build the project
-    $0 build              # Build the project
-    $0 test               # Run tests
-    $0 build --type Debug # Build in Debug mode
-    $0 all                # Build and run tests
-    $0 clean              # Clean build artifacts
-    $0 rebuild            # Clean and rebuild
+    $0                          # Build the project and run tests
+    $0 build                    # Build the project and run tests
+    $0 build --no-test          # Build only, skip tests
+    $0 test                     # Run tests only
+    $0 build --type Debug       # Build in Debug mode and run tests
+    $0 all                      # Build and run tests
+    $0 clean                    # Clean build artifacts
+    $0 rebuild                  # Clean and rebuild
 
 EOF
 }
@@ -229,7 +230,11 @@ case $COMMAND in
         build_project
         if [ "$RUN_TESTS" = true ]; then
             echo ""
-            print_info "Build completed. Run '$0 test' to execute tests."
+            if run_tests; then
+                exit 0
+            else
+                exit 1
+            fi
         fi
         ;;
     test)
@@ -246,6 +251,14 @@ case $COMMAND in
         clean_build
         echo ""
         build_project
+        if [ "$RUN_TESTS" = true ]; then
+            echo ""
+            if run_tests; then
+                exit 0
+            else
+                exit 1
+            fi
+        fi
         ;;
     all)
         build_project
