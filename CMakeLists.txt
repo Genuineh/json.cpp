@@ -41,6 +41,10 @@ if (JSON_CPP_BUILD_TESTS)
     add_executable(jsontestsuite_test jsontestsuite_test.cpp)
     target_link_libraries(jsontestsuite_test PRIVATE json)
 
+    add_executable(json_perf benchmarks/json_perf.cpp)
+    target_link_libraries(json_perf PRIVATE json)
+    target_compile_definitions(json_perf PRIVATE JTJSON_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+
     # Copy test data to build directory
     add_custom_command(
         TARGET jsontestsuite_test POST_BUILD
