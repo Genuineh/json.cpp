@@ -2350,12 +2350,22 @@ collectDescendants(JsonType* node, std::vector<JsonType*>& out)
     out.push_back(node);
     if (node->isArray()) {
         auto& arr = JsonAccessor<JsonType>::getArray(*node);
-        for (size_t i = 0; i < arr.size(); ++i)
-            collectDescendants(&arr[i], out);
+        const size_t arrSize = arr.size();
+        if (arrSize > 0) {
+            // Pre-reserve space to reduce reallocations
+            out.reserve(out.size() + arrSize);
+            for (size_t i = 0; i < arrSize; ++i)
+                collectDescendants(&arr[i], out);
+        }
     } else if (node->isObject()) {
         auto& obj = JsonAccessor<JsonType>::getObject(*node);
-        for (auto it = obj.begin(); it != obj.end(); ++it)
-            collectDescendants(&it->second, out);
+        const size_t objSize = obj.size();
+        if (objSize > 0) {
+            // Pre-reserve space to reduce reallocations
+            out.reserve(out.size() + objSize);
+            for (auto it = obj.begin(); it != obj.end(); ++it)
+                collectDescendants(&it->second, out);
+        }
     }
 }
 
@@ -2366,10 +2376,10 @@ applySlice(JsonType* node, const JsonPathSlice& slice, std::vector<JsonType*>& o
     if (!node->isArray())
         return;
     auto& arr = JsonAccessor<JsonType>::getArray(*node);
-    long long size = static_cast<long long>(arr.size());
+    const long long size = static_cast<long long>(arr.size());
     if (size == 0)
         return;
-    long long step = slice.hasStep ? slice.step : 1;
+    const long long step = slice.hasStep ? slice.step : 1;
     if (step == 0)
         throw std::runtime_error("JSONPath slice step cannot be zero");
     if (step > 0) {
@@ -2381,6 +2391,11 @@ applySlice(JsonType* node, const JsonPathSlice& slice, std::vector<JsonType*>& o
             end += size;
         start = std::max(0LL, std::min(start, size));
         end = std::max(0LL, std::min(end, size));
+        // Calculate expected capacity and reserve
+        if (start < end) {
+            const size_t expectedCount = static_cast<size_t>((end - start + step - 1) / step);
+            out.reserve(out.size() + expectedCount);
+        }
         for (long long i = start; i < end; i += step)
             out.push_back(&arr[static_cast<size_t>(i)]);
     } else {
@@ -2398,6 +2413,11 @@ applySlice(JsonType* node, const JsonPathSlice& slice, std::vector<JsonType*>& o
             end = size - 1;
         if (end < -1)
             end = -1;
+        // Calculate expected capacity for negative step
+        if (start > end) {
+            const size_t expectedCount = static_cast<size_t>((start - end - step - 1) / (-step));
+            out.reserve(out.size() + expectedCount);
+        }
         for (long long i = start; i > end; i += step) {
             if (i >= 0 && i < size)
                 out.push_back(&arr[static_cast<size_t>(i)]);
@@ -2868,18 +2888,42 @@ evaluatePathInternal(JsonType* start,
                      JsonType* documentRoot)
 {
     std::vector<JsonType*> current;
+    current.reserve(1);
     current.push_back(start);
     if (steps.empty())
         return current;
+    
     for (const JsonPathStep& step : steps) {
         std::vector<JsonType*> base;
         if (step.recursive) {
+            // Estimate capacity based on current size
+            base.reserve(current.size() * 4); // Heuristic for recursive expansion
             for (JsonType* node : current)
                 collectDescendants(node, base);
         } else {
             base = current;
         }
+        
         std::vector<JsonType*> next;
+        // Estimate capacity based on base size and step kind
+        if (!base.empty()) {
+            size_t estimatedCapacity = base.size();
+            switch (step.kind) {
+                case JsonPathStep::Kind::Wildcard:
+                    estimatedCapacity *= 8; // Heuristic for wildcard expansion
+                    break;
+                case JsonPathStep::Kind::Union:
+                    estimatedCapacity *= step.unionEntries.size();
+                    break;
+                case JsonPathStep::Kind::Indices:
+                    estimatedCapacity *= step.indices.size();
+                    break;
+                default:
+                    break;
+            }
+            next.reserve(estimatedCapacity);
+        }
+        
         for (JsonType* node : base) {
             switch (step.kind) {
                 case JsonPathStep::Kind::Name: {
@@ -2894,12 +2938,20 @@ evaluatePathInternal(JsonType* start,
                 case JsonPathStep::Kind::Wildcard: {
                     if (node->isArray()) {
                         auto& arr = JsonAccessor<JsonType>::getArray(*node);
-                        for (size_t i = 0; i < arr.size(); ++i)
-                            next.push_back(&arr[i]);
+                        const size_t arrSize = arr.size();
+                        if (arrSize > 0) {
+                            next.reserve(next.size() + arrSize);
+                            for (size_t i = 0; i < arrSize; ++i)
+                                next.push_back(&arr[i]);
+                        }
                     } else if (node->isObject()) {
                         auto& obj = JsonAccessor<JsonType>::getObject(*node);
-                        for (auto it = obj.begin(); it != obj.end(); ++it)
-                            next.push_back(&it->second);
+                        const size_t objSize = obj.size();
+                        if (objSize > 0) {
+                            next.reserve(next.size() + objSize);
+                            for (auto it = obj.begin(); it != obj.end(); ++it)
+                                next.push_back(&it->second);
+                        }
                     }
                     break;
                 }
@@ -2907,10 +2959,14 @@ evaluatePathInternal(JsonType* start,
                     if (!node->isArray())
                         break;
                     auto& arr = JsonAccessor<JsonType>::getArray(*node);
-                    for (long long raw : step.indices) {
-                        size_t idx;
-                        if (normalizeIndex(raw, arr.size(), idx))
-                            next.push_back(&arr[idx]);
+                    const size_t indicesCount = step.indices.size();
+                    if (indicesCount > 0) {
+                        next.reserve(next.size() + indicesCount);
+                        for (long long raw : step.indices) {
+                            size_t idx;
+                            if (normalizeIndex(raw, arr.size(), idx))
+                                next.push_back(&arr[idx]);
+                        }
                     }
                     break;
                 }
@@ -2928,17 +2984,25 @@ evaluatePathInternal(JsonType* start,
                     const Json& docRef = static_cast<const Json&>(*documentRoot);
                     if (node->isArray()) {
                         auto& arr = JsonAccessor<JsonType>::getArray(*node);
-                        for (size_t i = 0; i < arr.size(); ++i) {
-                            JsonType* candidate = &arr[i];
-                            if (FilterEvaluator::evaluate(step.filter, docRef, static_cast<const Json&>(arr[i])))
-                                next.push_back(candidate);
+                        const size_t arrSize = arr.size();
+                        if (arrSize > 0) {
+                            next.reserve(next.size() + arrSize / 2); // Estimate 50% pass filter
+                            for (size_t i = 0; i < arrSize; ++i) {
+                                JsonType* candidate = &arr[i];
+                                if (FilterEvaluator::evaluate(step.filter, docRef, static_cast<const Json&>(arr[i])))
+                                    next.push_back(candidate);
+                            }
                         }
                     } else if (node->isObject()) {
                         auto& obj = JsonAccessor<JsonType>::getObject(*node);
-                        for (auto it = obj.begin(); it != obj.end(); ++it) {
-                            JsonType* candidate = &it->second;
-                            if (FilterEvaluator::evaluate(step.filter, docRef, static_cast<const Json&>(it->second)))
-                                next.push_back(candidate);
+                        const size_t objSize = obj.size();
+                        if (objSize > 0) {
+                            next.reserve(next.size() + objSize / 2); // Estimate 50% pass filter
+                            for (auto it = obj.begin(); it != obj.end(); ++it) {
+                                JsonType* candidate = &it->second;
+                                if (FilterEvaluator::evaluate(step.filter, docRef, static_cast<const Json&>(it->second)))
+                                    next.push_back(candidate);
+                            }
                         }
                     }
                     break;
@@ -3011,23 +3075,31 @@ collectDescendantsWithParent(JsonPathNodeWithParent item,
     Json* node = item.node;
     if (node->isArray()) {
         auto& arr = node->getArray();
-        for (size_t i = 0; i < arr.size(); ++i) {
-            JsonPathNodeWithParent child(&arr[i]);
-            child.parent = node;
-            child.locationType = JsonPathNodeWithParent::ArrayIndex;
-            child.arrayIndex = i;
-            out.push_back(child);
-            collectDescendantsWithParent(child, out);
+        const size_t arrSize = arr.size();
+        if (arrSize > 0) {
+            out.reserve(out.size() + arrSize);
+            for (size_t i = 0; i < arrSize; ++i) {
+                JsonPathNodeWithParent child(&arr[i]);
+                child.parent = node;
+                child.locationType = JsonPathNodeWithParent::ArrayIndex;
+                child.arrayIndex = i;
+                out.push_back(child);
+                collectDescendantsWithParent(child, out);
+            }
         }
     } else if (node->isObject()) {
         auto& obj = node->getObject();
-        for (auto it = obj.begin(); it != obj.end(); ++it) {
-            JsonPathNodeWithParent child(&it->second);
-            child.parent = node;
-            child.locationType = JsonPathNodeWithParent::ObjectKey;
-            child.objectKey = it->first;
-            out.push_back(child);
-            collectDescendantsWithParent(child, out);
+        const size_t objSize = obj.size();
+        if (objSize > 0) {
+            out.reserve(out.size() + objSize);
+            for (auto it = obj.begin(); it != obj.end(); ++it) {
+                JsonPathNodeWithParent child(&it->second);
+                child.parent = node;
+                child.locationType = JsonPathNodeWithParent::ObjectKey;
+                child.objectKey = it->first;
+                out.push_back(child);
+                collectDescendantsWithParent(child, out);
+            }
         }
     }
 }
@@ -3038,6 +3110,7 @@ evaluatePathWithParentInternal(Json* start,
                                 Json* documentRoot)
 {
     std::vector<JsonPathNodeWithParent> current;
+    current.reserve(1);
     current.emplace_back(start);
     
     if (steps.empty())
@@ -3047,6 +3120,7 @@ evaluatePathWithParentInternal(Json* start,
         std::vector<JsonPathNodeWithParent> base;
         if (step.recursive) {
             // For recursive, collect all descendants with their parents
+            base.reserve(current.size() * 4); // Heuristic for recursive expansion
             for (auto& item : current) {
                 collectDescendantsWithParent(item, base);
             }
@@ -3055,6 +3129,25 @@ evaluatePathWithParentInternal(Json* start,
         }
         
         std::vector<JsonPathNodeWithParent> next;
+        // Estimate capacity based on base size and step kind
+        if (!base.empty()) {
+            size_t estimatedCapacity = base.size();
+            switch (step.kind) {
+                case JsonPathStep::Kind::Wildcard:
+                    estimatedCapacity *= 8; // Heuristic for wildcard expansion
+                    break;
+                case JsonPathStep::Kind::Union:
+                    estimatedCapacity *= step.unionEntries.size();
+                    break;
+                case JsonPathStep::Kind::Indices:
+                    estimatedCapacity *= step.indices.size();
+                    break;
+                default:
+                    break;
+            }
+            next.reserve(estimatedCapacity);
+        }
+        
         for (auto& item : base) {
             Json* node = item.node;
             switch (step.kind) {
@@ -3075,21 +3168,29 @@ evaluatePathWithParentInternal(Json* start,
                 case JsonPathStep::Kind::Wildcard: {
                     if (node->isArray()) {
                         auto& arr = node->getArray();
-                        for (size_t i = 0; i < arr.size(); ++i) {
-                            JsonPathNodeWithParent child(&arr[i]);
-                            child.parent = node;
-                            child.locationType = JsonPathNodeWithParent::ArrayIndex;
-                            child.arrayIndex = i;
-                            next.push_back(child);
+                        const size_t arrSize = arr.size();
+                        if (arrSize > 0) {
+                            next.reserve(next.size() + arrSize);
+                            for (size_t i = 0; i < arrSize; ++i) {
+                                JsonPathNodeWithParent child(&arr[i]);
+                                child.parent = node;
+                                child.locationType = JsonPathNodeWithParent::ArrayIndex;
+                                child.arrayIndex = i;
+                                next.push_back(child);
+                            }
                         }
                     } else if (node->isObject()) {
                         auto& obj = node->getObject();
-                        for (auto it = obj.begin(); it != obj.end(); ++it) {
-                            JsonPathNodeWithParent child(&it->second);
-                            child.parent = node;
-                            child.locationType = JsonPathNodeWithParent::ObjectKey;
-                            child.objectKey = it->first;
-                            next.push_back(child);
+                        const size_t objSize = obj.size();
+                        if (objSize > 0) {
+                            next.reserve(next.size() + objSize);
+                            for (auto it = obj.begin(); it != obj.end(); ++it) {
+                                JsonPathNodeWithParent child(&it->second);
+                                child.parent = node;
+                                child.locationType = JsonPathNodeWithParent::ObjectKey;
+                                child.objectKey = it->first;
+                                next.push_back(child);
+                            }
                         }
                     }
                     break;
@@ -3098,14 +3199,18 @@ evaluatePathWithParentInternal(Json* start,
                     if (!node->isArray())
                         break;
                     auto& arr = node->getArray();
-                    for (long long raw : step.indices) {
-                        size_t idx;
-                        if (normalizeIndex(raw, arr.size(), idx)) {
-                            JsonPathNodeWithParent child(&arr[idx]);
-                            child.parent = node;
-                            child.locationType = JsonPathNodeWithParent::ArrayIndex;
-                            child.arrayIndex = idx;
-                            next.push_back(child);
+                    const size_t indicesCount = step.indices.size();
+                    if (indicesCount > 0) {
+                        next.reserve(next.size() + indicesCount);
+                        for (long long raw : step.indices) {
+                            size_t idx;
+                            if (normalizeIndex(raw, arr.size(), idx)) {
+                                JsonPathNodeWithParent child(&arr[idx]);
+                                child.parent = node;
+                                child.locationType = JsonPathNodeWithParent::ArrayIndex;
+                                child.arrayIndex = idx;
+                                next.push_back(child);
+                            }
                         }
                     }
                     break;
@@ -3114,10 +3219,10 @@ evaluatePathWithParentInternal(Json* start,
                     if (!node->isArray())
                         break;
                     auto& arr = node->getArray();
-                    long long arrSize = static_cast<long long>(arr.size());
+                    const long long arrSize = static_cast<long long>(arr.size());
                     if (arrSize == 0)
                         break;
-                    long long sliceStep = step.slice.hasStep ? step.slice.step : 1;
+                    const long long sliceStep = step.slice.hasStep ? step.slice.step : 1;
                     if (sliceStep == 0)
                         throw std::runtime_error("JSONPath slice step cannot be zero");
                     if (sliceStep > 0) {
@@ -3129,6 +3234,11 @@ evaluatePathWithParentInternal(Json* start,
                             end += arrSize;
                         start = std::max(0LL, std::min(start, arrSize));
                         end = std::max(0LL, std::min(end, arrSize));
+                        // Calculate expected capacity and reserve
+                        if (start < end) {
+                            const size_t expectedCount = static_cast<size_t>((end - start + sliceStep - 1) / sliceStep);
+                            next.reserve(next.size() + expectedCount);
+                        }
                         for (long long i = start; i < end; i += sliceStep) {
                             JsonPathNodeWithParent child(&arr[static_cast<size_t>(i)]);
                             child.parent = node;
@@ -3151,6 +3261,11 @@ evaluatePathWithParentInternal(Json* start,
                             end = arrSize - 1;
                         if (end < -1)
                             end = -1;
+                        // Calculate expected capacity for negative step
+                        if (start > end) {
+                            const size_t expectedCount = static_cast<size_t>((start - end - sliceStep - 1) / (-sliceStep));
+                            next.reserve(next.size() + expectedCount);
+                        }
                         for (long long i = start; i > end; i += sliceStep) {
                             if (i >= 0 && i < arrSize) {
                                 JsonPathNodeWithParent child(&arr[static_cast<size_t>(i)]);
@@ -3201,21 +3316,29 @@ evaluatePathWithParentInternal(Json* start,
                             case JsonPathUnionKind::Wildcard:
                                 if (node->isArray()) {
                                     auto& arr = node->getArray();
-                                    for (size_t i = 0; i < arr.size(); ++i) {
-                                        JsonPathNodeWithParent child(&arr[i]);
-                                        child.parent = node;
-                                        child.locationType = JsonPathNodeWithParent::ArrayIndex;
-                                        child.arrayIndex = i;
-                                        next.push_back(child);
+                                    const size_t arrSize = arr.size();
+                                    if (arrSize > 0) {
+                                        next.reserve(next.size() + arrSize);
+                                        for (size_t i = 0; i < arrSize; ++i) {
+                                            JsonPathNodeWithParent child(&arr[i]);
+                                            child.parent = node;
+                                            child.locationType = JsonPathNodeWithParent::ArrayIndex;
+                                            child.arrayIndex = i;
+                                            next.push_back(child);
+                                        }
                                     }
                                 } else if (node->isObject()) {
                                     auto& obj = node->getObject();
-                                    for (auto it = obj.begin(); it != obj.end(); ++it) {
-                                        JsonPathNodeWithParent child(&it->second);
-                                        child.parent = node;
-                                        child.locationType = JsonPathNodeWithParent::ObjectKey;
-                                        child.objectKey = it->first;
-                                        next.push_back(child);
+                                    const size_t objSize = obj.size();
+                                    if (objSize > 0) {
+                                        next.reserve(next.size() + objSize);
+                                        for (auto it = obj.begin(); it != obj.end(); ++it) {
+                                            JsonPathNodeWithParent child(&it->second);
+                                            child.parent = node;
+                                            child.locationType = JsonPathNodeWithParent::ObjectKey;
+                                            child.objectKey = it->first;
+                                            next.push_back(child);
+                                        }
                                     }
                                 }
                                 break;
@@ -3229,24 +3352,32 @@ evaluatePathWithParentInternal(Json* start,
                     const Json& docRef = static_cast<const Json&>(*documentRoot);
                     if (node->isArray()) {
                         auto& arr = node->getArray();
-                        for (size_t i = 0; i < arr.size(); ++i) {
-                            if (FilterEvaluator::evaluate(step.filter, docRef, static_cast<const Json&>(arr[i]))) {
-                                JsonPathNodeWithParent child(&arr[i]);
-                                child.parent = node;
-                                child.locationType = JsonPathNodeWithParent::ArrayIndex;
-                                child.arrayIndex = i;
-                                next.push_back(child);
+                        const size_t arrSize = arr.size();
+                        if (arrSize > 0) {
+                            next.reserve(next.size() + arrSize / 2); // Estimate 50% pass filter
+                            for (size_t i = 0; i < arrSize; ++i) {
+                                if (FilterEvaluator::evaluate(step.filter, docRef, static_cast<const Json&>(arr[i]))) {
+                                    JsonPathNodeWithParent child(&arr[i]);
+                                    child.parent = node;
+                                    child.locationType = JsonPathNodeWithParent::ArrayIndex;
+                                    child.arrayIndex = i;
+                                    next.push_back(child);
+                                }
                             }
                         }
                     } else if (node->isObject()) {
                         auto& obj = node->getObject();
-                        for (auto it = obj.begin(); it != obj.end(); ++it) {
-                            if (FilterEvaluator::evaluate(step.filter, docRef, static_cast<const Json&>(it->second))) {
-                                JsonPathNodeWithParent child(&it->second);
-                                child.parent = node;
-                                child.locationType = JsonPathNodeWithParent::ObjectKey;
-                                child.objectKey = it->first;
-                                next.push_back(child);
+                        const size_t objSize = obj.size();
+                        if (objSize > 0) {
+                            next.reserve(next.size() + objSize / 2); // Estimate 50% pass filter
+                            for (auto it = obj.begin(); it != obj.end(); ++it) {
+                                if (FilterEvaluator::evaluate(step.filter, docRef, static_cast<const Json&>(it->second))) {
+                                    JsonPathNodeWithParent child(&it->second);
+                                    child.parent = node;
+                                    child.locationType = JsonPathNodeWithParent::ObjectKey;
+                                    child.objectKey = it->first;
+                                    next.push_back(child);
+                                }
                             }
                         }
                     }
