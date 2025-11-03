@@ -18,12 +18,18 @@
 #include "json.h"
 #include "jtckdint.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cctype>
 #include <climits>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <memory>
+#include <regex>
+#include <sstream>
 #include <stdexcept>
+#include <type_traits>
 
 #include "double-conversion/double-to-string.h"
 #include "double-conversion/string-to-double.h"
@@ -521,6 +527,17 @@ Json::getString()
     }
 }
 
+const std::string&
+Json::getString() const
+{
+    switch (type_) {
+        case String:
+            return string_value;
+        default:
+            ON_LOGIC_ERROR("JSON value is not a string.");
+    }
+}
+
 std::vector<Json>&
 Json::getArray()
 {
@@ -532,8 +549,30 @@ Json::getArray()
     }
 }
 
+const std::vector<Json>&
+Json::getArray() const
+{
+    switch (type_) {
+        case Array:
+            return array_value;
+        default:
+            ON_LOGIC_ERROR("JSON value is not an array.");
+    }
+}
+
 std::map<std::string, Json>&
 Json::getObject()
+{
+    switch (type_) {
+        case Object:
+            return object_value;
+        default:
+            ON_LOGIC_ERROR("JSON value is not an object.");
+    }
+}
+
+const std::map<std::string, Json>&
+Json::getObject() const
 {
     switch (type_) {
         case Object:
@@ -1237,6 +1276,1718 @@ Json::parse(const std::string& s)
     }
     return res;
 }
+
+namespace detail {
+
+struct JsonPathSlice
+{
+    bool hasStart = false;
+    long long start = 0;
+    bool hasEnd = false;
+    long long end = 0;
+    bool hasStep = false;
+    long long step = 1;
+};
+
+enum class JsonPathUnionKind
+{
+    Name,
+    Index,
+    Slice,
+    Wildcard
+};
+
+struct JsonPathUnionEntry
+{
+    JsonPathUnionKind kind = JsonPathUnionKind::Wildcard;
+    std::string name;
+    long long index = 0;
+    JsonPathSlice slice;
+};
+
+struct FilterNode;
+
+struct JsonPathStep
+{
+    enum class Kind
+    {
+        Name,
+        Wildcard,
+        Indices,
+        Slice,
+        Union,
+        Filter
+    };
+
+    Kind kind = Kind::Wildcard;
+    bool recursive = false;
+    std::string name;
+    std::vector<long long> indices;
+    JsonPathSlice slice;
+    std::vector<JsonPathUnionEntry> unionEntries;
+    std::shared_ptr<FilterNode> filter;
+};
+
+struct CompiledPath
+{
+    bool relative = false;
+    std::vector<JsonPathStep> steps;
+};
+
+struct FilterOperand
+{
+    enum class Type
+    {
+        Literal,
+        Path,
+        Function
+    };
+
+    struct FunctionCall
+    {
+        enum class Name
+        {
+            Length,
+            Size,
+            Count
+        };
+
+        Name name = Name::Length;
+        std::vector<FilterOperand> args;
+    };
+
+    Type type = Type::Literal;
+    Json literal;
+    CompiledPath path;
+    std::shared_ptr<FunctionCall> function;
+};
+
+struct FilterNode
+{
+    enum class Kind
+    {
+        Or,
+        And,
+        Not,
+        Comparison,
+        Exists
+    };
+
+    Kind kind = Kind::Exists;
+    std::string comparisonOp;
+    FilterOperand lhs;
+    FilterOperand rhs;
+    FilterOperand existsOperand;
+    std::shared_ptr<FilterNode> left;
+    std::shared_ptr<FilterNode> right;
+};
+
+static int
+hexValue(char c)
+{
+    if ('0' <= c && c <= '9')
+        return c - '0';
+    if ('a' <= c && c <= 'f')
+        return 10 + (c - 'a');
+    if ('A' <= c && c <= 'F')
+        return 10 + (c - 'A');
+    return -1;
+}
+
+static void
+appendUtf8(std::string& out, unsigned int codepoint)
+{
+    if (codepoint <= 0x7F) {
+        out.push_back(static_cast<char>(codepoint));
+    } else if (codepoint <= 0x7FF) {
+        out.push_back(static_cast<char>(0xC0 | (codepoint >> 6)));
+        out.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+    } else if (codepoint <= 0xFFFF) {
+        out.push_back(static_cast<char>(0xE0 | (codepoint >> 12)));
+        out.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+    } else if (codepoint <= 0x10FFFF) {
+        out.push_back(static_cast<char>(0xF0 | (codepoint >> 18)));
+        out.push_back(static_cast<char>(0x80 | ((codepoint >> 12) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+    } else {
+        throw std::runtime_error("Unicode codepoint out of range");
+    }
+}
+
+static unsigned int
+parseUnicodeEscape(const std::string& text, size_t& pos)
+{
+    if (pos + 4 > text.size())
+        throw std::runtime_error("Incomplete unicode escape sequence in JSONPath string literal");
+    unsigned int value = 0;
+    for (int i = 0; i < 4; ++i) {
+        int hv = hexValue(text[pos + i]);
+        if (hv < 0)
+            throw std::runtime_error("Invalid unicode escape in JSONPath string literal");
+        value = (value << 4) | static_cast<unsigned int>(hv);
+    }
+    pos += 4;
+    return value;
+}
+
+static std::string
+parseStringLiteral(const std::string& text, size_t& pos)
+{
+    if (pos >= text.size())
+        throw std::runtime_error("Expected string literal");
+    char quote = text[pos++];
+    if (quote != '\'' && quote != '"')
+        throw std::runtime_error("Expected quote character");
+    std::string result;
+    while (pos < text.size()) {
+        char c = text[pos++];
+        if (c == quote)
+            return result;
+        if (c == '\\') {
+            if (pos >= text.size())
+                throw std::runtime_error("Incomplete escape sequence in JSONPath string literal");
+            char esc = text[pos++];
+            switch (esc) {
+                case '\\':
+                case '"':
+                case '\'':
+                    result.push_back(esc);
+                    break;
+                case 'b':
+                    result.push_back('\b');
+                    break;
+                case 'f':
+                    result.push_back('\f');
+                    break;
+                case 'n':
+                    result.push_back('\n');
+                    break;
+                case 'r':
+                    result.push_back('\r');
+                    break;
+                case 't':
+                    result.push_back('\t');
+                    break;
+                case 'u': {
+                    unsigned int codepoint = parseUnicodeEscape(text, pos);
+                    if (0xD800 <= codepoint && codepoint <= 0xDBFF) {
+                        if (pos + 2 >= text.size() || text[pos] != '\\' || text[pos + 1] != 'u')
+                            throw std::runtime_error("Invalid high surrogate in JSONPath string literal");
+                        pos += 2;
+                        unsigned int low = parseUnicodeEscape(text, pos);
+                        if (!(0xDC00 <= low && low <= 0xDFFF))
+                            throw std::runtime_error("Invalid low surrogate in JSONPath string literal");
+                        codepoint = 0x10000 + ((codepoint - 0xD800) << 10) + (low - 0xDC00);
+                    } else if (0xDC00 <= codepoint && codepoint <= 0xDFFF) {
+                        throw std::runtime_error("Unexpected low surrogate in JSONPath string literal");
+                    }
+                    appendUtf8(result, codepoint);
+                    break;
+                }
+                default:
+                    throw std::runtime_error("Invalid escape sequence in JSONPath string literal");
+            }
+        } else {
+            result.push_back(c);
+        }
+    }
+    throw std::runtime_error("Unterminated string literal in JSONPath expression");
+}
+
+static void
+skipQuotedString(const std::string& text, size_t& pos)
+{
+    if (pos >= text.size())
+        throw std::runtime_error("Expected quoted string");
+    char quote = text[pos++];
+    if (quote != '\'' && quote != '"')
+        throw std::runtime_error("Expected quote character");
+    while (pos < text.size()) {
+        char c = text[pos++];
+        if (c == quote)
+            return;
+        if (c == '\\') {
+            if (pos >= text.size())
+                throw std::runtime_error("Incomplete escape sequence in JSONPath string literal");
+            ++pos;
+        }
+    }
+    throw std::runtime_error("Unterminated string literal in JSONPath expression");
+}
+
+class FilterExpressionParser;
+
+class JsonPathParser
+{
+  public:
+    explicit JsonPathParser(const std::string& input)
+      : input_(input)
+      , pos_(0)
+    {
+    }
+
+    CompiledPath parse();
+
+  private:
+    const std::string& input_;
+    size_t pos_;
+
+    void skipWhitespace();
+    bool parseSignedInteger(long long& value);
+    std::string parseIdentifier();
+    JsonPathStep parseSegment();
+    JsonPathStep parseBracket(bool recursive);
+    JsonPathUnionEntry parseBracketEntry();
+    std::shared_ptr<FilterNode> parseFilterExpression(const std::string& expression);
+    [[noreturn]] void error(const std::string& message) const;
+};
+
+class FilterExpressionParser
+{
+  public:
+    explicit FilterExpressionParser(const std::string& input)
+      : input_(input)
+      , pos_(0)
+    {
+        next();
+    }
+
+    std::shared_ptr<FilterNode> parse();
+
+  private:
+    enum class TokenType
+    {
+        End,
+        TrueLiteral,
+        FalseLiteral,
+        NullLiteral,
+        Number,
+        String,
+        Path,
+        Identifier,
+        LParen,
+        RParen,
+        Not,
+        And,
+        Or,
+        Eq,
+        Ne,
+        Lt,
+        Le,
+        Gt,
+        Ge,
+        Regex,
+        Comma
+    };
+
+    struct Token
+    {
+        TokenType type = TokenType::End;
+        std::string text;
+        double number = 0;
+    };
+
+    const std::string& input_;
+    size_t pos_;
+    Token current_;
+
+    void skipWhitespace();
+    Token lex();
+    void next();
+    bool match(TokenType type);
+    void expect(TokenType type, const char* message);
+    std::shared_ptr<FilterNode> parseOr();
+    std::shared_ptr<FilterNode> parseAnd();
+    std::shared_ptr<FilterNode> parseNot();
+    std::shared_ptr<FilterNode> parseComparison();
+    FilterOperand parseOperand();
+    FilterOperand parseFunctionCall(const std::string& name);
+    std::string parsePathLiteral();
+    [[noreturn]] void error(const std::string& message) const;
+};
+
+
+void
+JsonPathParser::skipWhitespace()
+{
+    while (pos_ < input_.size() &&
+           std::isspace(static_cast<unsigned char>(input_[pos_]))) {
+        ++pos_;
+    }
+}
+
+[[noreturn]] void
+JsonPathParser::error(const std::string& message) const
+{
+    std::ostringstream oss;
+    oss << "JSONPath parse error at position " << pos_ << ": " << message;
+    throw std::runtime_error(oss.str());
+}
+
+bool
+JsonPathParser::parseSignedInteger(long long& value)
+{
+    skipWhitespace();
+    size_t start = pos_;
+    if (pos_ < input_.size() && (input_[pos_] == '+' || input_[pos_] == '-'))
+        ++pos_;
+    size_t digitsStart = pos_;
+    while (pos_ < input_.size() &&
+           std::isdigit(static_cast<unsigned char>(input_[pos_]))) {
+        ++pos_;
+    }
+    if (digitsStart == pos_) {
+        pos_ = start;
+        return false;
+    }
+    std::string number = input_.substr(start, pos_ - start);
+    value = std::strtoll(number.c_str(), nullptr, 10);
+    return true;
+}
+
+std::string
+JsonPathParser::parseIdentifier()
+{
+    if (pos_ >= input_.size())
+        error("Expected identifier");
+    size_t start = pos_;
+    char c = input_[pos_];
+    if (!(std::isalpha(static_cast<unsigned char>(c)) || c == '_' || c == '$'))
+        error("Invalid identifier start");
+    ++pos_;
+    while (pos_ < input_.size()) {
+        char ch = input_[pos_];
+        if (std::isalnum(static_cast<unsigned char>(ch)) || ch == '_' || ch == '-')
+            ++pos_;
+        else
+            break;
+    }
+    return input_.substr(start, pos_ - start);
+}
+
+CompiledPath
+JsonPathParser::parse()
+{
+    CompiledPath result;
+    skipWhitespace();
+    if (pos_ >= input_.size())
+        error("Empty JSONPath expression");
+    char root = input_[pos_];
+    if (root == '$') {
+        result.relative = false;
+    } else if (root == '@') {
+        result.relative = true;
+    } else {
+        error("JSONPath must start with '$' or '@'");
+    }
+    ++pos_;
+    while (true) {
+        skipWhitespace();
+        if (pos_ >= input_.size())
+            break;
+        result.steps.emplace_back(parseSegment());
+    }
+    return result;
+}
+
+JsonPathStep
+JsonPathParser::parseSegment()
+{
+    skipWhitespace();
+    bool recursive = false;
+    if (pos_ < input_.size() && input_[pos_] == '.') {
+        ++pos_;
+        if (pos_ < input_.size() && input_[pos_] == '.') {
+            recursive = true;
+            ++pos_;
+        }
+    } else if (pos_ + 1 < input_.size() && input_[pos_] == '.' &&
+               input_[pos_ + 1] == '.') {
+        recursive = true;
+        pos_ += 2;
+    }
+    skipWhitespace();
+    if (pos_ >= input_.size())
+        error("Incomplete JSONPath segment");
+    if (input_[pos_] == '[')
+        return parseBracket(recursive);
+    if (input_[pos_] == '*') {
+        ++pos_;
+        JsonPathStep step;
+        step.kind = JsonPathStep::Kind::Wildcard;
+        step.recursive = recursive;
+        return step;
+    }
+    std::string name = parseIdentifier();
+    JsonPathStep step;
+    step.kind = JsonPathStep::Kind::Name;
+    step.recursive = recursive;
+    step.name = std::move(name);
+    return step;
+}
+
+JsonPathStep
+JsonPathParser::parseBracket(bool recursive)
+{
+    if (input_[pos_] != '[')
+        error("Expected '['");
+    ++pos_;
+    skipWhitespace();
+    if (pos_ >= input_.size())
+        error("Unterminated '[' segment");
+    if (input_[pos_] == '?') {
+        ++pos_;
+        skipWhitespace();
+        if (pos_ >= input_.size() || input_[pos_] != '(')
+            error("Expected '(' after '?' in filter expression");
+        ++pos_;
+        size_t exprStart = pos_;
+        int depth = 1;
+        while (pos_ < input_.size() && depth > 0) {
+            char c = input_[pos_++];
+            if (c == '\'' || c == '"') {
+                size_t temp = pos_ - 1;
+                skipQuotedString(input_, temp);
+                pos_ = temp;
+            } else if (c == '(') {
+                ++depth;
+            } else if (c == ')') {
+                --depth;
+            }
+        }
+        if (depth != 0)
+            error("Unterminated filter expression");
+        size_t exprEnd = pos_ - 1;
+        std::string filterExpr = input_.substr(exprStart, exprEnd - exprStart);
+        skipWhitespace();
+        if (pos_ >= input_.size() || input_[pos_] != ']')
+            error("Expected ']' after filter expression");
+        ++pos_;
+        JsonPathStep step;
+        step.kind = JsonPathStep::Kind::Filter;
+        step.recursive = recursive;
+        step.filter = parseFilterExpression(filterExpr);
+        return step;
+    }
+    if (input_[pos_] == '*') {
+        ++pos_;
+        skipWhitespace();
+        if (pos_ >= input_.size() || input_[pos_] != ']')
+            error("Expected ']' after '*'");
+        ++pos_;
+        JsonPathStep step;
+        step.kind = JsonPathStep::Kind::Wildcard;
+        step.recursive = recursive;
+        return step;
+    }
+    std::vector<JsonPathUnionEntry> entries;
+    entries.emplace_back(parseBracketEntry());
+    skipWhitespace();
+    while (pos_ < input_.size() && input_[pos_] == ',') {
+        ++pos_;
+        skipWhitespace();
+        entries.emplace_back(parseBracketEntry());
+        skipWhitespace();
+    }
+    if (pos_ >= input_.size() || input_[pos_] != ']')
+        error("Expected ']' after bracket expression");
+    ++pos_;
+    JsonPathStep step;
+    step.recursive = recursive;
+    if (entries.size() == 1) {
+        const JsonPathUnionEntry& entry = entries.front();
+        switch (entry.kind) {
+            case JsonPathUnionKind::Name:
+                step.kind = JsonPathStep::Kind::Name;
+                step.name = entry.name;
+                break;
+            case JsonPathUnionKind::Index:
+                step.kind = JsonPathStep::Kind::Indices;
+                step.indices.push_back(entry.index);
+                break;
+            case JsonPathUnionKind::Slice:
+                step.kind = JsonPathStep::Kind::Slice;
+                step.slice = entry.slice;
+                break;
+            case JsonPathUnionKind::Wildcard:
+                step.kind = JsonPathStep::Kind::Wildcard;
+                break;
+        }
+    } else {
+        step.kind = JsonPathStep::Kind::Union;
+        step.unionEntries = std::move(entries);
+    }
+    return step;
+}
+
+JsonPathUnionEntry
+JsonPathParser::parseBracketEntry()
+{
+    skipWhitespace();
+    if (pos_ >= input_.size())
+        error("Unexpected end of bracket expression");
+    char c = input_[pos_];
+    if (c == '\'' || c == '"') {
+        std::string name = parseStringLiteral(input_, pos_);
+        JsonPathUnionEntry entry;
+        entry.kind = JsonPathUnionKind::Name;
+        entry.name = std::move(name);
+        return entry;
+    }
+    if (c == '*') {
+        ++pos_;
+        JsonPathUnionEntry entry;
+        entry.kind = JsonPathUnionKind::Wildcard;
+        return entry;
+    }
+    size_t before = pos_;
+    long long number = 0;
+    bool hasNumber = parseSignedInteger(number);
+    skipWhitespace();
+    if (pos_ < input_.size() && input_[pos_] == ':') {
+        ++pos_;
+        JsonPathSlice slice;
+        slice.hasStart = hasNumber;
+        if (slice.hasStart)
+            slice.start = number;
+        skipWhitespace();
+        long long endValue = 0;
+        bool hasEnd = parseSignedInteger(endValue);
+        slice.hasEnd = hasEnd;
+        if (slice.hasEnd)
+            slice.end = endValue;
+        skipWhitespace();
+        if (pos_ < input_.size() && input_[pos_] == ':') {
+            ++pos_;
+            skipWhitespace();
+            long long stepValue = 0;
+            if (!parseSignedInteger(stepValue))
+                error("Slice step expects integer");
+            slice.hasStep = true;
+            slice.step = stepValue;
+        }
+        JsonPathUnionEntry entry;
+        entry.kind = JsonPathUnionKind::Slice;
+        entry.slice = slice;
+        return entry;
+    }
+    if (hasNumber) {
+        JsonPathUnionEntry entry;
+        entry.kind = JsonPathUnionKind::Index;
+        entry.index = number;
+        return entry;
+    }
+    pos_ = before;
+    std::string name = parseIdentifier();
+    JsonPathUnionEntry entry;
+    entry.kind = JsonPathUnionKind::Name;
+    entry.name = std::move(name);
+    return entry;
+}
+
+std::shared_ptr<FilterNode>
+JsonPathParser::parseFilterExpression(const std::string& expression)
+{
+    FilterExpressionParser parser(expression);
+    return parser.parse();
+}
+
+
+void
+FilterExpressionParser::skipWhitespace()
+{
+    while (pos_ < input_.size() &&
+           std::isspace(static_cast<unsigned char>(input_[pos_]))) {
+        ++pos_;
+    }
+}
+
+[[noreturn]] void
+FilterExpressionParser::error(const std::string& message) const
+{
+    std::ostringstream oss;
+    oss << "JSONPath filter parse error at position " << pos_ << ": "
+        << message;
+    throw std::runtime_error(oss.str());
+}
+
+void
+FilterExpressionParser::next()
+{
+    current_ = lex();
+}
+
+bool
+FilterExpressionParser::match(TokenType type)
+{
+    if (current_.type == type) {
+        next();
+        return true;
+    }
+    return false;
+}
+
+void
+FilterExpressionParser::expect(TokenType type, const char* message)
+{
+    if (!match(type))
+        error(message);
+}
+
+FilterExpressionParser::Token
+FilterExpressionParser::lex()
+{
+    skipWhitespace();
+    Token token;
+    if (pos_ >= input_.size()) {
+        token.type = TokenType::End;
+        return token;
+    }
+    char c = input_[pos_];
+    if (c == '&' && pos_ + 1 < input_.size() && input_[pos_ + 1] == '&') {
+        pos_ += 2;
+        token.type = TokenType::And;
+        token.text = "&&";
+        return token;
+    }
+    if (c == '|' && pos_ + 1 < input_.size() && input_[pos_ + 1] == '|') {
+        pos_ += 2;
+        token.type = TokenType::Or;
+        token.text = "||";
+        return token;
+    }
+    if (c == '=' && pos_ + 1 < input_.size() && input_[pos_ + 1] == '=') {
+        pos_ += 2;
+        token.type = TokenType::Eq;
+        token.text = "==";
+        return token;
+    }
+    if (c == '!' && pos_ + 1 < input_.size() && input_[pos_ + 1] == '=') {
+        pos_ += 2;
+        token.type = TokenType::Ne;
+        token.text = "!=";
+        return token;
+    }
+    if (c == '<' && pos_ + 1 < input_.size() && input_[pos_ + 1] == '=') {
+        pos_ += 2;
+        token.type = TokenType::Le;
+        token.text = "<=";
+        return token;
+    }
+    if (c == '<') {
+        ++pos_;
+        token.type = TokenType::Lt;
+        token.text = "<";
+        return token;
+    }
+
+    if (c == '>' && pos_ + 1 < input_.size() && input_[pos_ + 1] == '=') {
+        pos_ += 2;
+        token.type = TokenType::Ge;
+        token.text = ">=";
+        return token;
+    }
+    if (c == '>') {
+        ++pos_;
+        token.type = TokenType::Gt;
+        token.text = ">";
+        return token;
+    }
+
+    if (c == '=' && pos_ + 1 < input_.size() && input_[pos_ + 1] == '~') {
+        pos_ += 2;
+        token.type = TokenType::Regex;
+        token.text = "=~";
+        return token;
+    }
+    switch (c) {
+        case '!':
+            ++pos_;
+            token.type = TokenType::Not;
+            token.text = "!";
+            return token;
+        case '(':
+            ++pos_;
+            token.type = TokenType::LParen;
+            token.text = "(";
+            return token;
+        case ')':
+            ++pos_;
+            token.type = TokenType::RParen;
+            token.text = ")";
+            return token;
+        case ',':
+            ++pos_;
+            token.type = TokenType::Comma;
+            token.text = ",";
+            return token;
+    }
+    if (c == '\'' || c == '"') {
+        token.text = parseStringLiteral(input_, pos_);
+        token.type = TokenType::String;
+        return token;
+    }
+    if (c == '@' || c == '$') {
+        token.text = parsePathLiteral();
+        token.type = TokenType::Path;
+        return token;
+    }
+    if (std::isdigit(static_cast<unsigned char>(c)) || c == '-' || c == '+') {
+        size_t start = pos_;
+        if (input_[pos_] == '-' || input_[pos_] == '+')
+            ++pos_;
+        bool hasDigits = false;
+        while (pos_ < input_.size() &&
+               std::isdigit(static_cast<unsigned char>(input_[pos_]))) {
+            ++pos_;
+            hasDigits = true;
+        }
+        if (pos_ < input_.size() && input_[pos_] == '.') {
+            ++pos_;
+            while (pos_ < input_.size() &&
+                   std::isdigit(static_cast<unsigned char>(input_[pos_]))) {
+                ++pos_;
+                hasDigits = true;
+            }
+        }
+        if (pos_ < input_.size() && (input_[pos_] == 'e' || input_[pos_] == 'E')) {
+            ++pos_;
+            if (pos_ < input_.size() && (input_[pos_] == '+' || input_[pos_] == '-'))
+                ++pos_;
+            while (pos_ < input_.size() &&
+                   std::isdigit(static_cast<unsigned char>(input_[pos_]))) {
+                ++pos_;
+                hasDigits = true;
+            }
+        }
+        if (!hasDigits)
+            error("Invalid numeric literal in filter expression");
+        token.text = input_.substr(start, pos_ - start);
+        token.number = std::strtod(token.text.c_str(), nullptr);
+        token.type = TokenType::Number;
+        return token;
+    }
+    if (std::isalpha(static_cast<unsigned char>(c)) || c == '_') {
+        size_t start = pos_;
+        while (pos_ < input_.size() &&
+               (std::isalnum(static_cast<unsigned char>(input_[pos_])) ||
+                input_[pos_] == '_' || input_[pos_] == '-')) {
+            ++pos_;
+        }
+        token.text = input_.substr(start, pos_ - start);
+        if (token.text == "true") {
+            token.type = TokenType::TrueLiteral;
+        } else if (token.text == "false") {
+            token.type = TokenType::FalseLiteral;
+        } else if (token.text == "null") {
+            token.type = TokenType::NullLiteral;
+        } else {
+            token.type = TokenType::Identifier;
+        }
+        return token;
+    }
+    error("Unexpected character in filter expression");
+    return token;
+}
+
+std::shared_ptr<FilterNode>
+FilterExpressionParser::parse()
+{
+    auto node = parseOr();
+    if (current_.type != TokenType::End)
+        error("Unexpected token at end of filter expression");
+    return node;
+}
+
+std::shared_ptr<FilterNode>
+FilterExpressionParser::parseOr()
+{
+    auto node = parseAnd();
+    while (current_.type == TokenType::Or) {
+        next();
+        auto rhs = parseAnd();
+        auto parent = std::make_shared<FilterNode>();
+        parent->kind = FilterNode::Kind::Or;
+        parent->left = node;
+        parent->right = rhs;
+        node = parent;
+    }
+    return node;
+}
+
+std::shared_ptr<FilterNode>
+FilterExpressionParser::parseAnd()
+{
+    auto node = parseNot();
+    while (current_.type == TokenType::And) {
+        next();
+        auto rhs = parseNot();
+        auto parent = std::make_shared<FilterNode>();
+        parent->kind = FilterNode::Kind::And;
+        parent->left = node;
+        parent->right = rhs;
+        node = parent;
+    }
+    return node;
+}
+
+std::shared_ptr<FilterNode>
+FilterExpressionParser::parseNot()
+{
+    if (current_.type == TokenType::Not) {
+        next();
+        auto child = parseNot();
+        auto node = std::make_shared<FilterNode>();
+        node->kind = FilterNode::Kind::Not;
+        node->left = child;
+        return node;
+    }
+    return parseComparison();
+}
+
+std::shared_ptr<FilterNode>
+FilterExpressionParser::parseComparison()
+{
+    if (current_.type == TokenType::LParen) {
+        next();
+        auto node = parseOr();
+        expect(TokenType::RParen, "Expected ')' in filter expression");
+        return node;
+    }
+    FilterOperand left = parseOperand();
+    if (current_.type == TokenType::Eq || current_.type == TokenType::Ne ||
+        current_.type == TokenType::Lt || current_.type == TokenType::Le ||
+        current_.type == TokenType::Gt || current_.type == TokenType::Ge ||
+        current_.type == TokenType::Regex) {
+        std::string op = current_.text;
+        next();
+        FilterOperand right = parseOperand();
+        auto node = std::make_shared<FilterNode>();
+        node->kind = FilterNode::Kind::Comparison;
+        node->comparisonOp = std::move(op);
+        node->lhs = std::move(left);
+        node->rhs = std::move(right);
+        return node;
+    }
+    auto node = std::make_shared<FilterNode>();
+    node->kind = FilterNode::Kind::Exists;
+    node->existsOperand = std::move(left);
+    return node;
+}
+
+FilterOperand
+FilterExpressionParser::parseOperand()
+{
+    FilterOperand operand;
+    switch (current_.type) {
+        case TokenType::TrueLiteral:
+            operand.type = FilterOperand::Type::Literal;
+            operand.literal = Json(true);
+            next();
+            return operand;
+        case TokenType::FalseLiteral:
+            operand.type = FilterOperand::Type::Literal;
+            operand.literal = Json(false);
+            next();
+            return operand;
+        case TokenType::NullLiteral:
+            operand.type = FilterOperand::Type::Literal;
+            operand.literal = Json(nullptr);
+            next();
+            return operand;
+        case TokenType::Number: {
+            operand.type = FilterOperand::Type::Literal;
+            if (current_.text.find_first_of(".eE") == std::string::npos) {
+                long long val = std::strtoll(current_.text.c_str(), nullptr, 10);
+                operand.literal = Json(val);
+            } else {
+                operand.literal = Json(current_.number);
+            }
+            next();
+            return operand;
+        }
+        case TokenType::String:
+            operand.type = FilterOperand::Type::Literal;
+            operand.literal = Json(current_.text);
+            next();
+            return operand;
+        case TokenType::Path: {
+            JsonPathParser parser(current_.text);
+            operand.type = FilterOperand::Type::Path;
+            operand.path = parser.parse();
+            next();
+            return operand;
+        }
+        case TokenType::Identifier: {
+            std::string name = current_.text;
+            next();
+            if (current_.type == TokenType::LParen)
+                return parseFunctionCall(name);
+            error("Unexpected identifier in filter expression");
+        }
+        default:
+            error("Unexpected token in filter operand");
+    }
+    return operand;
+}
+
+FilterOperand
+FilterExpressionParser::parseFunctionCall(const std::string& name)
+{
+    FilterOperand operand;
+    operand.type = FilterOperand::Type::Function;
+    operand.function = std::make_shared<FilterOperand::FunctionCall>();
+    std::string lowered;
+    lowered.resize(name.size());
+    std::transform(name.begin(), name.end(), lowered.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    if (lowered == "length" || lowered == "size") {
+        operand.function->name = FilterOperand::FunctionCall::Name::Length;
+    } else if (lowered == "count") {
+        operand.function->name = FilterOperand::FunctionCall::Name::Count;
+    } else {
+        error("Unsupported function in filter expression");
+    }
+    expect(TokenType::LParen, "Expected '(' after function name");
+    if (current_.type != TokenType::RParen) {
+        operand.function->args.push_back(parseOperand());
+        while (current_.type == TokenType::Comma) {
+            next();
+            operand.function->args.push_back(parseOperand());
+        }
+    }
+    expect(TokenType::RParen, "Expected ')' after function call");
+    return operand;
+}
+
+std::string
+FilterExpressionParser::parsePathLiteral()
+{
+    size_t start = pos_;
+    int bracketDepth = 0;
+    while (pos_ < input_.size()) {
+        char c = input_[pos_];
+        if (c == '\'' || c == '"') {
+            size_t temp = pos_;
+            skipQuotedString(input_, temp);
+            pos_ = temp;
+            continue;
+        }
+        if (c == '[') {
+            ++bracketDepth;
+            ++pos_;
+            continue;
+        }
+        if (c == ']') {
+            if (bracketDepth == 0)
+                break;
+            --bracketDepth;
+            ++pos_;
+            continue;
+        }
+        if (bracketDepth == 0) {
+            if (std::isspace(static_cast<unsigned char>(c)) || c == ')' || c == '(' ||
+                c == ',' || c == '!' || c == '=' || c == '<' || c == '>' ||
+                c == '&' || c == '|') {
+                break;
+            }
+        }
+        ++pos_;
+    }
+    if (start == pos_)
+        error("Expected path literal");
+    return input_.substr(start, pos_ - start);
+}
+
+template <typename JsonType>
+struct JsonAccessor;
+
+template <>
+struct JsonAccessor<Json>
+{
+    using Pointer = Json*;
+    using ArrayType = std::vector<Json>;
+    using ObjectType = std::map<std::string, Json>;
+
+    static bool isArray(const Json& value) { return value.isArray(); }
+    static bool isObject(const Json& value) { return value.isObject(); }
+    static ArrayType& getArray(Json& value) { return value.getArray(); }
+    static ObjectType& getObject(Json& value) { return value.getObject(); }
+};
+
+template <>
+struct JsonAccessor<const Json>
+{
+    using Pointer = const Json*;
+    using ArrayType = const std::vector<Json>;
+    using ObjectType = const std::map<std::string, Json>;
+
+    static bool isArray(const Json& value) { return value.isArray(); }
+    static bool isObject(const Json& value) { return value.isObject(); }
+    static const ArrayType& getArray(const Json& value) { return value.getArray(); }
+    static const ObjectType& getObject(const Json& value) { return value.getObject(); }
+};
+
+static bool
+normalizeIndex(long long index, size_t size, size_t& out)
+{
+    long long normalized = index;
+    if (normalized < 0)
+        normalized += static_cast<long long>(size);
+    if (normalized < 0 || normalized >= static_cast<long long>(size))
+        return false;
+    out = static_cast<size_t>(normalized);
+    return true;
+}
+
+template <typename JsonType>
+static void
+collectDescendants(JsonType* node, std::vector<JsonType*>& out)
+{
+    out.push_back(node);
+    if (node->isArray()) {
+        auto& arr = JsonAccessor<JsonType>::getArray(*node);
+        for (size_t i = 0; i < arr.size(); ++i)
+            collectDescendants(&arr[i], out);
+    } else if (node->isObject()) {
+        auto& obj = JsonAccessor<JsonType>::getObject(*node);
+        for (auto it = obj.begin(); it != obj.end(); ++it)
+            collectDescendants(&it->second, out);
+    }
+}
+
+template <typename JsonType>
+static void
+applySlice(JsonType* node, const JsonPathSlice& slice, std::vector<JsonType*>& out)
+{
+    if (!node->isArray())
+        return;
+    auto& arr = JsonAccessor<JsonType>::getArray(*node);
+    long long size = static_cast<long long>(arr.size());
+    if (size == 0)
+        return;
+    long long step = slice.hasStep ? slice.step : 1;
+    if (step == 0)
+        throw std::runtime_error("JSONPath slice step cannot be zero");
+    if (step > 0) {
+        long long start = slice.hasStart ? slice.start : 0;
+        long long end = slice.hasEnd ? slice.end : size;
+        if (start < 0)
+            start += size;
+        if (end < 0)
+            end += size;
+        start = std::max(0LL, std::min(start, size));
+        end = std::max(0LL, std::min(end, size));
+        for (long long i = start; i < end; i += step)
+            out.push_back(&arr[static_cast<size_t>(i)]);
+    } else {
+        long long start = slice.hasStart ? slice.start : (size - 1);
+        long long end = slice.hasEnd ? slice.end : -1;
+        if (start < 0)
+            start += size;
+        if (end < 0)
+            end += size;
+        if (start >= size)
+            start = size - 1;
+        if (start < 0)
+            start = -1;
+        if (end >= size)
+            end = size - 1;
+        if (end < -1)
+            end = -1;
+        for (long long i = start; i > end; i += step) {
+            if (i >= 0 && i < size)
+                out.push_back(&arr[static_cast<size_t>(i)]);
+        }
+    }
+}
+
+template <typename JsonType>
+static void
+applyUnionEntry(JsonType* node,
+                const JsonPathUnionEntry& entry,
+                std::vector<JsonType*>& out)
+{
+    switch (entry.kind) {
+        case JsonPathUnionKind::Name: {
+            if (!node->isObject())
+                return;
+            auto& obj = JsonAccessor<JsonType>::getObject(*node);
+            auto it = obj.find(entry.name);
+            if (it != obj.end())
+                out.push_back(&it->second);
+            break;
+        }
+        case JsonPathUnionKind::Index: {
+            if (!node->isArray())
+                return;
+            auto& arr = JsonAccessor<JsonType>::getArray(*node);
+            size_t idx;
+            if (normalizeIndex(entry.index, arr.size(), idx))
+                out.push_back(&arr[idx]);
+            break;
+        }
+        case JsonPathUnionKind::Slice:
+            applySlice(node, entry.slice, out);
+            break;
+        case JsonPathUnionKind::Wildcard: {
+            if (node->isArray()) {
+                auto& arr = JsonAccessor<JsonType>::getArray(*node);
+                for (size_t i = 0; i < arr.size(); ++i)
+                    out.push_back(&arr[i]);
+            } else if (node->isObject()) {
+                auto& obj = JsonAccessor<JsonType>::getObject(*node);
+                for (auto it = obj.begin(); it != obj.end(); ++it)
+                    out.push_back(&it->second);
+            }
+            break;
+        }
+    }
+}
+
+
+
+template <typename JsonType>
+static std::vector<JsonType*>
+evaluatePathInternal(JsonType* start,
+                     const std::vector<JsonPathStep>& steps,
+                     JsonType* documentRoot);
+
+static std::vector<Json*>
+evaluatePathMutable(Json& start,
+                    const std::vector<JsonPathStep>& steps,
+                    Json& documentRoot);
+
+static std::vector<const Json*>
+evaluatePathConst(const Json& start,
+                  const std::vector<JsonPathStep>& steps,
+                  const Json& documentRoot);
+struct EvaluatedOperand
+{
+    std::vector<const Json*> nodes;
+    std::vector<std::shared_ptr<Json>> owned;
+
+    void addOwned(Json value)
+    {
+        auto ptr = std::make_shared<Json>(std::move(value));
+        nodes.push_back(ptr.get());
+        owned.push_back(std::move(ptr));
+    }
+};
+
+class FilterEvaluator
+{
+  public:
+    static bool evaluate(const std::shared_ptr<FilterNode>& node,
+                         const Json& documentRoot,
+                         const Json& context);
+
+  private:
+    static EvaluatedOperand evaluateOperand(const FilterOperand& operand,
+                                            const Json& documentRoot,
+                                            const Json& context);
+    static std::vector<const Json*> evaluatePath(const CompiledPath& path,
+                                                 const Json& documentRoot,
+                                                 const Json& context);
+    static Json evaluateFunction(const FilterOperand::FunctionCall& fn,
+                                 const Json& documentRoot,
+                                 const Json& context);
+    static bool compare(const std::string& op,
+                        const EvaluatedOperand& lhs,
+                        const EvaluatedOperand& rhs);
+    static bool equalsAny(const EvaluatedOperand& lhs,
+                          const EvaluatedOperand& rhs);
+    static bool notEquals(const EvaluatedOperand& lhs,
+                          const EvaluatedOperand& rhs);
+    static bool relational(const std::string& op,
+                           const EvaluatedOperand& lhs,
+                           const EvaluatedOperand& rhs);
+    static bool regexMatch(const EvaluatedOperand& lhs,
+                           const EvaluatedOperand& rhs);
+    static bool truthy(const EvaluatedOperand& operand);
+    static bool truthy(const Json& value);
+    static bool toNumber(const Json& value, double& out);
+    static bool toString(const Json& value, std::string& out);
+    static bool jsonEquals(const Json& lhs, const Json& rhs);
+    static bool compareNumbers(double lhs, double rhs, const std::string& op);
+    static bool compareStrings(const std::string& lhs,
+                               const std::string& rhs,
+                               const std::string& op);
+    static long long computeLength(const Json& value);
+};
+
+bool
+FilterEvaluator::evaluate(const std::shared_ptr<FilterNode>& node,
+                          const Json& documentRoot,
+                          const Json& context)
+{
+    if (!node)
+        return false;
+    switch (node->kind) {
+        case FilterNode::Kind::Or:
+            return evaluate(node->left, documentRoot, context) ||
+                   evaluate(node->right, documentRoot, context);
+        case FilterNode::Kind::And:
+            return evaluate(node->left, documentRoot, context) &&
+                   evaluate(node->right, documentRoot, context);
+        case FilterNode::Kind::Not:
+            return !evaluate(node->left, documentRoot, context);
+        case FilterNode::Kind::Comparison: {
+            EvaluatedOperand lhs = evaluateOperand(node->lhs, documentRoot, context);
+            EvaluatedOperand rhs = evaluateOperand(node->rhs, documentRoot, context);
+            return compare(node->comparisonOp, lhs, rhs);
+        }
+        case FilterNode::Kind::Exists: {
+            EvaluatedOperand lhs = evaluateOperand(node->existsOperand, documentRoot, context);
+            return truthy(lhs);
+        }
+    }
+    return false;
+}
+
+EvaluatedOperand
+FilterEvaluator::evaluateOperand(const FilterOperand& operand,
+                                 const Json& documentRoot,
+                                 const Json& context)
+{
+    EvaluatedOperand result;
+    switch (operand.type) {
+        case FilterOperand::Type::Literal:
+            result.addOwned(operand.literal);
+            break;
+        case FilterOperand::Type::Path: {
+            auto matches = evaluatePath(operand.path, documentRoot, context);
+            result.nodes.insert(result.nodes.end(), matches.begin(), matches.end());
+            break;
+        }
+        case FilterOperand::Type::Function: {
+            Json value = evaluateFunction(*operand.function, documentRoot, context);
+            result.addOwned(std::move(value));
+            break;
+        }
+    }
+    return result;
+}
+
+std::vector<const Json*>
+FilterEvaluator::evaluatePath(const CompiledPath& path,
+                              const Json& documentRoot,
+                              const Json& context)
+{
+    if (path.relative)
+        return evaluatePathConst(context, path.steps, documentRoot);
+    return evaluatePathConst(documentRoot, path.steps, documentRoot);
+}
+
+Json
+FilterEvaluator::evaluateFunction(const FilterOperand::FunctionCall& fn,
+                                  const Json& documentRoot,
+                                  const Json& context)
+{
+    if (fn.args.size() != 1)
+        throw std::runtime_error("Filter function expects exactly one argument");
+    EvaluatedOperand arg = evaluateOperand(fn.args[0], documentRoot, context);
+    const Json* target = nullptr;
+    if (!arg.nodes.empty())
+        target = arg.nodes.front();
+    if (!target)
+        return Json(0);
+    switch (fn.name) {
+        case FilterOperand::FunctionCall::Name::Length:
+            return Json(static_cast<long long>(computeLength(*target)));
+        case FilterOperand::FunctionCall::Name::Count:
+            if (target->isArray())
+                return Json(static_cast<long long>(target->getArray().size()));
+            if (target->isObject())
+                return Json(static_cast<long long>(target->getObject().size()));
+            return Json(1);
+        default:
+            throw std::runtime_error("Unsupported filter function");
+    }
+}
+
+bool
+FilterEvaluator::compare(const std::string& op,
+                         const EvaluatedOperand& lhs,
+                         const EvaluatedOperand& rhs)
+{
+    if (op == "==")
+        return equalsAny(lhs, rhs);
+    if (op == "!=")
+        return notEquals(lhs, rhs);
+    if (op == "<" || op == "<=" || op == ">" || op == ">=")
+        return relational(op, lhs, rhs);
+    if (op == "=~")
+        return regexMatch(lhs, rhs);
+    return false;
+}
+
+bool
+FilterEvaluator::equalsAny(const EvaluatedOperand& lhs,
+                           const EvaluatedOperand& rhs)
+{
+    if (lhs.nodes.empty() || rhs.nodes.empty())
+        return false;
+    for (const Json* l : lhs.nodes) {
+        for (const Json* r : rhs.nodes) {
+            if (jsonEquals(*l, *r))
+                return true;
+        }
+    }
+    return false;
+}
+
+bool
+FilterEvaluator::notEquals(const EvaluatedOperand& lhs,
+                           const EvaluatedOperand& rhs)
+{
+    if (lhs.nodes.empty())
+        return false;
+    if (rhs.nodes.empty())
+        return true;
+    for (const Json* l : lhs.nodes) {
+        bool anyEqual = false;
+        for (const Json* r : rhs.nodes) {
+            if (jsonEquals(*l, *r)) {
+                anyEqual = true;
+                break;
+            }
+        }
+        if (!anyEqual)
+            return true;
+    }
+    return false;
+}
+
+bool
+FilterEvaluator::relational(const std::string& op,
+                            const EvaluatedOperand& lhs,
+                            const EvaluatedOperand& rhs)
+{
+    if (lhs.nodes.empty() || rhs.nodes.empty())
+        return false;
+    for (const Json* l : lhs.nodes) {
+        double left;
+        std::string leftStr;
+        bool leftNum = toNumber(*l, left);
+        bool leftString = toString(*l, leftStr);
+        for (const Json* r : rhs.nodes) {
+            double right;
+            std::string rightStr;
+            bool rightNum = toNumber(*r, right);
+            bool rightString = toString(*r, rightStr);
+            if (leftNum && rightNum && compareNumbers(left, right, op))
+                return true;
+            if (leftString && rightString && compareStrings(leftStr, rightStr, op))
+                return true;
+        }
+    }
+    return false;
+}
+
+bool
+FilterEvaluator::regexMatch(const EvaluatedOperand& lhs,
+                            const EvaluatedOperand& rhs)
+{
+    if (lhs.nodes.empty() || rhs.nodes.empty())
+        return false;
+    std::string pattern;
+    if (!toString(*rhs.nodes.front(), pattern))
+        return false;
+    try {
+        std::regex re(pattern);
+        for (const Json* l : lhs.nodes) {
+            std::string text;
+            if (toString(*l, text) && std::regex_search(text, re))
+                return true;
+        }
+    } catch (const std::regex_error&) {
+        throw std::runtime_error("Invalid regular expression in JSONPath filter");
+    }
+    return false;
+}
+
+bool
+FilterEvaluator::truthy(const EvaluatedOperand& operand)
+{
+    for (const Json* node : operand.nodes) {
+        if (truthy(*node))
+            return true;
+    }
+    return false;
+}
+
+bool
+FilterEvaluator::truthy(const Json& value)
+{
+    if (value.isNull())
+        return false;
+    if (value.isBool())
+        return value.getBool();
+    if (value.isLong())
+        return value.getLong() != 0;
+    if (value.isDouble() || value.isFloat())
+        return value.getNumber() != 0.0;
+    if (value.isString())
+        return !value.getString().empty();
+    if (value.isArray())
+        return !value.getArray().empty();
+    if (value.isObject())
+        return !value.getObject().empty();
+    return false;
+}
+
+bool
+FilterEvaluator::toNumber(const Json& value, double& out)
+{
+    if (value.isLong()) {
+        out = static_cast<double>(value.getLong());
+        return true;
+    }
+    if (value.isDouble() || value.isFloat()) {
+        out = value.getNumber();
+        return true;
+    }
+    if (value.isBool()) {
+        out = value.getBool() ? 1.0 : 0.0;
+        return true;
+    }
+    return false;
+}
+
+bool
+FilterEvaluator::toString(const Json& value, std::string& out)
+{
+    if (value.isString()) {
+        out = value.getString();
+        return true;
+    }
+    return false;
+}
+
+bool
+FilterEvaluator::jsonEquals(const Json& lhs, const Json& rhs)
+{
+    if (lhs.getType() != rhs.getType()) {
+        if (lhs.isNumber() && rhs.isNumber()) {
+            double l, r;
+            return toNumber(lhs, l) && toNumber(rhs, r) && l == r;
+        }
+        return false;
+    }
+    if (lhs.isNull())
+        return true;
+    if (lhs.isBool())
+        return lhs.getBool() == rhs.getBool();
+    if (lhs.isLong())
+        return lhs.getLong() == rhs.getLong();
+    if (lhs.isDouble() || lhs.isFloat())
+        return lhs.getNumber() == rhs.getNumber();
+    if (lhs.isString())
+        return lhs.getString() == rhs.getString();
+    if (lhs.isArray()) {
+        const auto& larr = lhs.getArray();
+        const auto& rarr = rhs.getArray();
+        if (larr.size() != rarr.size())
+            return false;
+        for (size_t i = 0; i < larr.size(); ++i) {
+            if (!jsonEquals(larr[i], rarr[i]))
+                return false;
+        }
+        return true;
+    }
+    if (lhs.isObject()) {
+        const auto& lobj = lhs.getObject();
+        const auto& robj = rhs.getObject();
+        if (lobj.size() != robj.size())
+            return false;
+        auto lit = lobj.begin();
+        auto rit = robj.begin();
+        for (; lit != lobj.end(); ++lit, ++rit) {
+            if (lit->first != rit->first)
+                return false;
+            if (!jsonEquals(lit->second, rit->second))
+                return false;
+        }
+        return true;
+    }
+    return false;
+}
+
+bool
+FilterEvaluator::compareNumbers(double lhs, double rhs, const std::string& op)
+{
+    if (op == "<")
+        return lhs < rhs;
+    if (op == "<=")
+        return lhs <= rhs;
+    if (op == ">")
+        return lhs > rhs;
+    if (op == ">=")
+        return lhs >= rhs;
+    return false;
+}
+
+bool
+FilterEvaluator::compareStrings(const std::string& lhs,
+                                const std::string& rhs,
+                                const std::string& op)
+{
+    if (op == "<")
+        return lhs < rhs;
+    if (op == "<=")
+        return lhs <= rhs;
+    if (op == ">")
+        return lhs > rhs;
+    if (op == ">=")
+        return lhs >= rhs;
+    return false;
+}
+
+long long
+FilterEvaluator::computeLength(const Json& value)
+{
+    if (value.isString())
+        return static_cast<long long>(value.getString().size());
+    if (value.isArray())
+        return static_cast<long long>(value.getArray().size());
+    if (value.isObject())
+        return static_cast<long long>(value.getObject().size());
+    return 0;
+}
+
+
+
+template <typename JsonType>
+static std::vector<JsonType*>
+evaluatePathInternal(JsonType* start,
+                     const std::vector<JsonPathStep>& steps,
+                     JsonType* documentRoot)
+{
+    std::vector<JsonType*> current;
+    current.push_back(start);
+    if (steps.empty())
+        return current;
+    for (const JsonPathStep& step : steps) {
+        std::vector<JsonType*> base;
+        if (step.recursive) {
+            for (JsonType* node : current)
+                collectDescendants(node, base);
+        } else {
+            base = current;
+        }
+        std::vector<JsonType*> next;
+        for (JsonType* node : base) {
+            switch (step.kind) {
+                case JsonPathStep::Kind::Name: {
+                    if (!node->isObject())
+                        break;
+                    auto& obj = JsonAccessor<JsonType>::getObject(*node);
+                    auto it = obj.find(step.name);
+                    if (it != obj.end())
+                        next.push_back(&it->second);
+                    break;
+                }
+                case JsonPathStep::Kind::Wildcard: {
+                    if (node->isArray()) {
+                        auto& arr = JsonAccessor<JsonType>::getArray(*node);
+                        for (size_t i = 0; i < arr.size(); ++i)
+                            next.push_back(&arr[i]);
+                    } else if (node->isObject()) {
+                        auto& obj = JsonAccessor<JsonType>::getObject(*node);
+                        for (auto it = obj.begin(); it != obj.end(); ++it)
+                            next.push_back(&it->second);
+                    }
+                    break;
+                }
+                case JsonPathStep::Kind::Indices: {
+                    if (!node->isArray())
+                        break;
+                    auto& arr = JsonAccessor<JsonType>::getArray(*node);
+                    for (long long raw : step.indices) {
+                        size_t idx;
+                        if (normalizeIndex(raw, arr.size(), idx))
+                            next.push_back(&arr[idx]);
+                    }
+                    break;
+                }
+                case JsonPathStep::Kind::Slice:
+                    applySlice(node, step.slice, next);
+                    break;
+                case JsonPathStep::Kind::Union: {
+                    for (const auto& entry : step.unionEntries)
+                        applyUnionEntry(node, entry, next);
+                    break;
+                }
+                case JsonPathStep::Kind::Filter: {
+                    if (!step.filter)
+                        break;
+                    const Json& docRef = static_cast<const Json&>(*documentRoot);
+                    if (node->isArray()) {
+                        auto& arr = JsonAccessor<JsonType>::getArray(*node);
+                        for (size_t i = 0; i < arr.size(); ++i) {
+                            JsonType* candidate = &arr[i];
+                            if (FilterEvaluator::evaluate(step.filter, docRef, static_cast<const Json&>(arr[i])))
+                                next.push_back(candidate);
+                        }
+                    } else if (node->isObject()) {
+                        auto& obj = JsonAccessor<JsonType>::getObject(*node);
+                        for (auto it = obj.begin(); it != obj.end(); ++it) {
+                            JsonType* candidate = &it->second;
+                            if (FilterEvaluator::evaluate(step.filter, docRef, static_cast<const Json&>(it->second)))
+                                next.push_back(candidate);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        current.swap(next);
+    }
+    return current;
+}
+
+static std::vector<Json*>
+evaluatePathMutable(Json& start,
+                    const std::vector<JsonPathStep>& steps,
+                    Json& documentRoot)
+{
+    return evaluatePathInternal<Json>(&start, steps, &documentRoot);
+}
+
+static std::vector<const Json*>
+evaluatePathConst(const Json& start,
+                  const std::vector<JsonPathStep>& steps,
+                  const Json& documentRoot)
+{
+    return evaluatePathInternal<const Json>(&start, steps, &documentRoot);
+}
+
+} // namespace detail
+
+std::vector<Json*>
+Json::jsonpath(const std::string& expression)
+{
+    detail::JsonPathParser parser(expression);
+    detail::CompiledPath compiled = parser.parse();
+    if (compiled.relative)
+        throw std::runtime_error("JSONPath expression must start with '$'");
+    return detail::evaluatePathInternal<Json>(this, compiled.steps, this);
+}
+
+std::vector<const Json*>
+Json::jsonpath(const std::string& expression) const
+{
+    detail::JsonPathParser parser(expression);
+    detail::CompiledPath compiled = parser.parse();
+    if (compiled.relative)
+        throw std::runtime_error("JSONPath expression must start with '$'");
+    return detail::evaluatePathInternal<const Json>(this, compiled.steps, this);
+}
+
 
 const char*
 Json::StatusToString(Json::Status status)

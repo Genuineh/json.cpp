@@ -87,6 +87,44 @@ static const char kHuge[] = R"([
 1e00,2e+00,2e-00
 ,"rosebud"])";
 
+static const char kStoreExample[] = R"({
+  "store": {
+    "book": [
+      {
+        "category": "reference",
+        "author": "Nigel Rees",
+        "title": "Sayings of the Century",
+        "price": 8.95
+      },
+      {
+        "category": "fiction",
+        "author": "Evelyn Waugh",
+        "title": "Sword of Honour",
+        "price": 12.99
+      },
+      {
+        "category": "fiction",
+        "author": "Herman Melville",
+        "title": "Moby Dick",
+        "isbn": "0-553-21311-3",
+        "price": 8.99
+      },
+      {
+        "category": "fiction",
+        "author": "J. R. R. Tolkien",
+        "title": "The Lord of the Rings",
+        "isbn": "0-395-19395-8",
+        "price": 22.99
+      }
+    ],
+    "bicycle": {
+      "color": "red",
+      "price": 19.95
+    }
+  },
+  "expensive": 10
+})";
+
 #define BENCH(ITERATIONS, WORK_PER_RUN, CODE) \
     do { \
         auto start = std::chrono::high_resolution_clock::now(); \
@@ -151,6 +189,48 @@ parse_test()
   "b": [2, 3]
 })")
         exit(7);
+}
+
+
+void
+jsonpath_test()
+{
+    auto parsed = Json::parse(kStoreExample);
+    if (parsed.first != Json::success)
+        exit(90);
+    Json& json = parsed.second;
+
+    auto authors = json.jsonpath("$.store.book[*].author");
+    if (authors.size() != 4)
+        exit(91);
+    if (!authors[0]->isString() || authors[0]->getString() != "Nigel Rees")
+        exit(92);
+
+    auto cheap = json.jsonpath("$.store.book[?(@.price < 10)].title");
+    if (cheap.size() != 2)
+        exit(93);
+    if (cheap[0]->getString() != "Sayings of the Century" ||
+        cheap[1]->getString() != "Moby Dick")
+        exit(94);
+
+    auto recursive = json.jsonpath("$..price");
+    if (recursive.size() != 5)
+        exit(95);
+
+    auto slice = json.jsonpath("$.store.book[1:3].author");
+    if (slice.size() != 2 || slice[0]->getString() != "Evelyn Waugh" ||
+        slice[1]->getString() != "Herman Melville")
+        exit(96);
+
+    auto unionNodes = json.jsonpath("$.store['bicycle','book']");
+    if (unionNodes.size() != 2 || !unionNodes[0]->isObject() ||
+        !unionNodes[1]->isArray())
+        exit(97);
+
+    const Json& cref = json;
+    auto constAuthors = cref.jsonpath("$..author");
+    if (constAuthors.size() != 4)
+        exit(98);
 }
 
 static const struct
@@ -455,6 +535,7 @@ main()
     object_test();
     deep_test();
     parse_test();
+    jsonpath_test();
     round_trip_test();
     afl_regression();
     json_test_suite();
