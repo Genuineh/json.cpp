@@ -233,6 +233,55 @@ jsonpath_test()
         exit(98);
 }
 
+void
+jsonpath_update_delete_test()
+{
+    // Test update
+    auto parsed = Json::parse(kStoreExample);
+    if (parsed.first != Json::success)
+        exit(100);
+    Json json = parsed.second;
+
+    // Update single field
+    size_t count = json.updateJsonpath("$.expensive", Json(20));
+    if (count != 1)
+        exit(101);
+    if (json["expensive"].getLong() != 20)
+        exit(102);
+
+    // Update multiple fields
+    count = json.updateJsonpath("$.store.book[*].price", Json(9.99));
+    if (count != 4)
+        exit(103);
+    auto prices = json.jsonpath("$.store.book[*].price");
+    for (const Json* price : prices) {
+        if (price->getDouble() != 9.99)
+            exit(104);
+    }
+
+    // Test delete
+    Json testObj = Json::parse(R"({"a": 1, "b": 2, "c": 3})").second;
+    count = testObj.deleteJsonpath("$.b");
+    if (count != 1)
+        exit(105);
+    if (testObj.toString() != R"({"a":1,"c":3})")
+        exit(106);
+
+    // Delete from array
+    Json testArr = Json::parse(R"([1, 2, 3, 4, 5])").second;
+    count = testArr.deleteJsonpath("$[1:3]");
+    if (count != 2)
+        exit(107);
+    if (testArr.toString() != "[1,4,5]")
+        exit(108);
+
+    // Delete multiple matching fields
+    Json testMulti = Json::parse(R"({"items": [{"id": 1, "name": "a"}, {"id": 2, "name": "b"}, {"id": 3, "name": "c"}]})").second;
+    count = testMulti.deleteJsonpath("$.items[*].name");
+    if (count != 3)
+        exit(109);
+}
+
 static const struct
 {
     std::string before;
@@ -536,6 +585,7 @@ main()
     deep_test();
     parse_test();
     jsonpath_test();
+    jsonpath_update_delete_test();
     round_trip_test();
     afl_regression();
     json_test_suite();
