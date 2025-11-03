@@ -282,6 +282,140 @@ jsonpath_update_delete_test()
         exit(109);
 }
 
+// Performance test data - larger JSON structure for realistic benchmarks
+static const char kLargeJsonExample[] = R"({
+  "store": {
+    "book": [
+      {"category": "reference", "author": "Nigel Rees", "title": "Sayings of the Century", "price": 8.95},
+      {"category": "fiction", "author": "Evelyn Waugh", "title": "Sword of Honour", "price": 12.99},
+      {"category": "fiction", "author": "Herman Melville", "title": "Moby Dick", "isbn": "0-553-21311-3", "price": 8.99},
+      {"category": "fiction", "author": "J. R. R. Tolkien", "title": "The Lord of the Rings", "isbn": "0-395-19395-8", "price": 22.99},
+      {"category": "fiction", "author": "Jane Austen", "title": "Pride and Prejudice", "price": 9.95},
+      {"category": "fiction", "author": "Charles Dickens", "title": "A Tale of Two Cities", "price": 11.50},
+      {"category": "reference", "author": "John Doe", "title": "Technical Manual", "price": 15.00},
+      {"category": "fiction", "author": "Mark Twain", "title": "Adventures of Huckleberry Finn", "price": 7.99}
+    ],
+    "bicycle": {"color": "red", "price": 19.95},
+    "car": {"color": "blue", "price": 29999.99},
+    "electronics": [
+      {"name": "laptop", "price": 1299.99, "stock": 10},
+      {"name": "phone", "price": 899.99, "stock": 25},
+      {"name": "tablet", "price": 599.99, "stock": 15}
+    ]
+  },
+  "expensive": 10
+})";
+
+void
+jsonpath_query_perf_test()
+{
+    auto parsed = Json::parse(kLargeJsonExample);
+    if (parsed.first != Json::success)
+        exit(200);
+    Json& json = parsed.second;
+
+    // Test simple path query
+    auto authors = json.jsonpath("$.store.book[*].author");
+    if (authors.size() != 8)
+        exit(201);
+
+    // Test recursive query
+    auto prices = json.jsonpath("$..price");
+    if (prices.size() != 13)  // 8 books + 1 bicycle + 1 car + 3 electronics
+        exit(202);
+
+    // Test filter query
+    auto cheap = json.jsonpath("$.store.book[?(@.price < 10)].title");
+    if (cheap.size() != 4)  // 8.95, 8.99, 9.95, 7.99
+        exit(203);
+
+    // Test slice query
+    auto slice = json.jsonpath("$.store.book[1:5].author");
+    if (slice.size() != 4)
+        exit(204);
+
+    // Test union query
+    auto unionNodes = json.jsonpath("$.store['bicycle','car']");
+    if (unionNodes.size() != 2)
+        exit(205);
+
+    // Test const version
+    const Json& cref = json;
+    auto constPrices = cref.jsonpath("$..price");
+    if (constPrices.size() != 13)
+        exit(206);
+}
+
+void
+jsonpath_update_perf_test()
+{
+    auto parsed = Json::parse(kLargeJsonExample);
+    if (parsed.first != Json::success)
+        exit(210);
+    Json json = parsed.second;
+
+    // Update single field
+    size_t count = json.updateJsonpath("$.expensive", Json(20));
+    if (count != 1)
+        exit(211);
+
+    // Update multiple fields
+    count = json.updateJsonpath("$.store.book[*].price", Json(9.99));
+    if (count != 8)
+        exit(212);
+
+    // Update with filter
+    count = json.updateJsonpath("$.store.electronics[?(@.stock > 20)].stock", Json(30));
+    if (count != 1)
+        exit(213);
+}
+
+void
+jsonpath_delete_perf_test()
+{
+    // Test delete single field
+    Json testObj = Json::parse(R"({"a": 1, "b": 2, "c": 3, "d": 4})").second;
+    size_t count = testObj.deleteJsonpath("$.b");
+    if (count != 1)
+        exit(220);
+
+    // Test delete from array
+    Json testArr = Json::parse(R"([1, 2, 3, 4, 5, 6, 7, 8])").second;
+    count = testArr.deleteJsonpath("$[1:4]");
+    if (count != 3)
+        exit(221);
+
+    // Test delete multiple matching fields
+    Json testMulti = Json::parse(kLargeJsonExample).second;
+    count = testMulti.deleteJsonpath("$.store.book[*].price");
+    if (count != 8)
+        exit(222);
+}
+
+void
+jsonpath_complex_perf_test()
+{
+    auto parsed = Json::parse(kLargeJsonExample);
+    if (parsed.first != Json::success)
+        exit(230);
+    Json& json = parsed.second;
+
+    // Complex nested query
+    auto nested = json.jsonpath("$.store.book[?(@.category == 'fiction' && @.price < 15)].author");
+    if (nested.size() != 5)  // 12.99, 8.99, 9.95, 11.50, 7.99
+        exit(231);
+
+    // Deep recursive query
+    auto deep = json.jsonpath("$..*");
+    if (deep.size() == 0)
+        exit(232);
+
+    // Multiple filters
+    auto filtered = json.jsonpath("$.store.book[?(@.price > 10 && @.price < 20)].title");
+    if (filtered.size() != 3)  // 12.99, 11.50, 15.00
+        exit(233);
+}
+
 static const struct
 {
     std::string before;
@@ -595,4 +729,10 @@ main()
     BENCH(2000, 1, parse_test());
     BENCH(2000, 1, round_trip_test());
     BENCH(2000, 1, json_test_suite());
+    
+    // JSONPath performance tests
+    BENCH(2000, 1, jsonpath_query_perf_test());
+    BENCH(2000, 1, jsonpath_update_perf_test());
+    BENCH(2000, 1, jsonpath_delete_perf_test());
+    BENCH(2000, 1, jsonpath_complex_perf_test());
 }
