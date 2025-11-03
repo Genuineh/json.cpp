@@ -28,6 +28,7 @@ Commands:
     rebuild     Clean and build
     all         Build and run tests (same as build)
     example     Build example program
+    perf        Build and run the json_perf benchmarks
     help        Show this help message
 
 Options:
@@ -131,6 +132,25 @@ run_tests() {
     fi
 }
 
+run_perf() {
+    print_info "Preparing performance benchmarks..."
+
+    if [ ! -d "$BUILD_DIR" ]; then
+        print_warn "Build directory not found. Building first..."
+        build_project
+    fi
+
+    cd "$BUILD_DIR"
+
+    print_info "Building json_perf target..."
+    cmake --build . --config "${BUILD_TYPE}" ${VERBOSE_BUILD} --target json_perf
+
+    print_info "Running json_perf ${PERF_ARGS[*]}"
+    ./json_perf "${PERF_ARGS[@]}"
+
+    cd ..
+}
+
 # Clean build artifacts
 clean_build() {
     print_info "Cleaning build artifacts..."
@@ -187,10 +207,11 @@ VERBOSE_CMAKE=""
 VERBOSE_BUILD=""
 VERBOSE_CTEST=""
 RUN_TESTS=true
+PERF_ARGS=()
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        build|test|clean|rebuild|all|example|help)
+        build|test|clean|rebuild|all|example|perf|help)
             COMMAND="$1"
             shift
             ;;
@@ -211,6 +232,15 @@ while [[ $# -gt 0 ]]; do
         --no-test)
             RUN_TESTS=false
             shift
+            ;;
+        --)
+            shift
+            PERF_ARGS=()
+            while [[ $# -gt 0 ]]; do
+                PERF_ARGS+=("$1")
+                shift
+            done
+            break
             ;;
         -h|--help)
             print_usage
@@ -276,6 +306,13 @@ case $COMMAND in
         ;;
     example)
         build_example
+        ;;
+    perf)
+        if run_perf; then
+            exit 0
+        else
+            exit 1
+        fi
         ;;
     help)
         print_usage

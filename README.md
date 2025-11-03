@@ -69,6 +69,13 @@ than 3x) advantage, which we haven't figured out how to explain yet.
       16617 ns 2000x json_test_suite()
 ```
 
+For broader coverage, the `json_perf` binary exercises large synthetic
+corpora under `benchmarks/corpus/`, the JSONTestSuite valid/invalid
+cases, and several JSONPath query/update scenarios while reporting
+latency and throughput stats. Build it with `cmake --build build --target
+json_perf` and run `./build/json_perf --runs 5 --warmup 1` to collect the
+extended performance snapshot.
+
 ## Usage Example
 
 The [llamafile](https://github.com/Mozilla-Ocho/llamafile) project uses
