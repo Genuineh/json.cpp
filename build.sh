@@ -224,6 +224,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Change to project root directory
+# This ensures all relative paths in functions work correctly regardless of
+# where the script is invoked from
+cd "$PROJECT_ROOT"
+
 # Execute command
 case $COMMAND in
     build)
