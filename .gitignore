@@ -7,3 +7,7 @@
 /*_test
 /.aarch64
 /build
+# example ???????
+example/*.o
+example/*.a
+example/json_example
