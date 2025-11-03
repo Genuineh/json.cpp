@@ -199,6 +199,25 @@ Client::v1_chat_completions()
 
 See also <https://github.com/Mozilla-Ocho/llamafile/blob/main/llamafile/server/v1_chat_completions.cpp>
 
+### JSONPath Queries
+
+The parser now supports JSONPath queries on any `Json` value via the
+`jsonpath()` helper. The function returns a list of pointers to matching
+nodes, which can then be inspected or modified:
+
+```cpp
+auto [status, json] = Json::parse(R"({"numbers":[{"value":1},{"value":5}]})");
+if (status != Json::success)
+    return;
+
+for (Json* node : json.jsonpath("$.numbers[?(@.value > 1)].value"))
+    node->getLong(); // 5
+```
+
+Filters support comparison operators, boolean logic, and simple functions
+like `length()`/`size()`. Both the mutable and const overloads are
+available; the latter yields `const Json*` results.
+
 ## JSONTestSuite Results
 
 Here's the results of running `jsontestsuite_test` for json.cpp.

@@ -191,8 +191,11 @@ class Json
     double getNumber() const;
     long long getLong() const;
     std::string& getString();
+    const std::string& getString() const;
     std::vector<Json>& getArray();
+    const std::vector<Json>& getArray() const;
     std::map<std::string, Json>& getObject();
+    const std::map<std::string, Json>& getObject() const;
 
     bool contains(const std::string&) const;
 
@@ -201,6 +204,9 @@ class Json
 
     std::string toString() const;
     std::string toStringPretty() const;
+
+    std::vector<Json*> jsonpath(const std::string&);
+    std::vector<const Json*> jsonpath(const std::string&) const;
 
     Json& operator=(const Json&);
     Json& operator=(Json&&);
