@@ -208,6 +208,10 @@ class Json
     std::vector<Json*> jsonpath(const std::string&);
     std::vector<const Json*> jsonpath(const std::string&) const;
 
+    size_t updateJsonpath(const std::string&, const Json&);
+    size_t updateJsonpath(const std::string&, Json&&);
+    size_t deleteJsonpath(const std::string&);
+
     Json& operator=(const Json&);
     Json& operator=(Json&&);
 
