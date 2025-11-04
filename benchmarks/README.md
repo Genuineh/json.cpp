@@ -182,6 +182,92 @@ cases.push_back({
 });
 ```
 
+## Automated Comparison and Visualization
+
+### Comparing Benchmark Results
+
+Use the comparison tools to analyze performance differences between baseline and current results:
+
+#### Python Version
+```bash
+# Text output (default)
+python3 benchmarks/compare_benchmarks.py baseline.json current.json
+
+# Markdown format
+python3 benchmarks/compare_benchmarks.py baseline.json current.json --format markdown
+
+# JSON format for further processing
+python3 benchmarks/compare_benchmarks.py baseline.json current.json --format json -o comparison.json
+
+# CSV format for spreadsheet import
+python3 benchmarks/compare_benchmarks.py baseline.json current.json --format csv -o comparison.csv
+
+# Custom regression threshold (default: 5%)
+python3 benchmarks/compare_benchmarks.py baseline.json current.json --threshold 10
+
+# Sort by regressions (show worst first)
+python3 benchmarks/compare_benchmarks.py baseline.json current.json --sort regression
+```
+
+#### Node.js Version
+```bash
+# Same functionality with Node.js
+node benchmarks/compare_benchmarks.js baseline.json current.json --format markdown
+```
+
+### HTML Visualization Reports
+
+Generate interactive HTML reports with charts:
+
+```bash
+# Basic HTML report
+python3 benchmarks/generate_html_report.py results.json
+
+# With baseline comparison
+python3 benchmarks/generate_html_report.py current.json --baseline baseline.json
+
+# Custom output file and title
+python3 benchmarks/generate_html_report.py results.json \
+  --output performance_report.html \
+  --title "My Benchmark Results"
+
+# Dark theme
+python3 benchmarks/generate_html_report.py results.json --theme dark
+```
+
+The HTML report includes:
+- Summary statistics with configuration details
+- Interactive bar charts for median execution time
+- Line charts showing performance metric distribution (min, median, mean, P95, max)
+- Throughput comparison charts
+- Baseline vs current comparison charts (when baseline provided)
+- Detailed statistics table with all metrics
+
+### Workflow Example
+
+Complete workflow for regression testing:
+
+```bash
+# 1. Generate baseline
+./build/json_perf --runs 20 --warmup 3 --report json > baseline.json
+
+# 2. Make code changes, rebuild
+./build.sh
+
+# 3. Generate current results
+./build/json_perf --runs 20 --warmup 3 --report json > current.json
+
+# 4. Compare and analyze
+python3 benchmarks/compare_benchmarks.py baseline.json current.json --format markdown > comparison.md
+
+# 5. Generate visualization
+python3 benchmarks/generate_html_report.py current.json --baseline baseline.json -o report.html
+
+# 6. Open report in browser
+xdg-open report.html  # Linux
+open report.html      # macOS
+```
+
 ## Best Practices
 
 1. **Warmup** - Always use warmup runs to stabilize CPU frequency
@@ -189,21 +275,52 @@ cases.push_back({
 3. **Filter tests** - Focus on relevant benchmarks during development
 4. **Report formats** - Use JSON/CSV for automated analysis
 5. **Baseline tracking** - Save baseline results for regression detection
+6. **Visualization** - Use HTML reports for comprehensive analysis and presentations
+7. **Automated comparison** - Use comparison tools in CI/CD for regression detection
 
 ## Integration with CI/CD
 
-Example GitHub Actions workflow:
+Example GitHub Actions workflow with automated comparison:
 
 ```yaml
-- name: Performance benchmarks
+- name: Run baseline benchmarks (main branch)
   run: |
-    ./build.sh perf -- --runs 10 --report json > perf.json
+    git fetch origin main
+    git checkout origin/main
+    ./build.sh perf -- --runs 10 --report json > baseline.json
+    
+- name: Run current benchmarks
+  run: |
+    git checkout ${{ github.sha }}
+    ./build.sh perf -- --runs 10 --report json > current.json
+    
+- name: Compare results
+  run: |
+    python3 benchmarks/compare_benchmarks.py baseline.json current.json --format markdown > comparison.md
+    python3 benchmarks/generate_html_report.py current.json --baseline baseline.json -o report.html
     
 - name: Upload results
   uses: actions/upload-artifact@v3
   with:
     name: performance-results
-    path: perf.json
+    path: |
+      baseline.json
+      current.json
+      comparison.md
+      report.html
+      
+- name: Comment on PR
+  uses: actions/github-script@v6
+  with:
+    script: |
+      const fs = require('fs');
+      const comparison = fs.readFileSync('comparison.md', 'utf8');
+      github.rest.issues.createComment({
+        issue_number: context.issue.number,
+        owner: context.repo.owner,
+        repo: context.repo.repo,
+        body: comparison
+      });
 ```
 
 ## Profiling

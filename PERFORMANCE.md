@@ -221,12 +221,60 @@ To establish baseline performance and detect regressions:
 
 2. **Make code changes**
 
-3. **Generate comparison report:**
+3. **Generate current results:**
    ```bash
-   ./build/json_perf --runs 20 --warmup 3 --report json > comparison.json
+   ./build/json_perf --runs 20 --warmup 3 --report json > current.json
    ```
 
-4. **Compare results** using your preferred analysis tool or script
+4. **Compare results using automated tools:**
+   
+   **Text format (terminal output):**
+   ```bash
+   python3 benchmarks/compare_benchmarks.py baseline.json current.json
+   ```
+   
+   **Markdown format (for documentation/PRs):**
+   ```bash
+   python3 benchmarks/compare_benchmarks.py baseline.json current.json --format markdown > comparison.md
+   ```
+   
+   **JSON format (for further processing):**
+   ```bash
+   python3 benchmarks/compare_benchmarks.py baseline.json current.json --format json -o comparison.json
+   ```
+   
+   **Using Node.js:**
+   ```bash
+   node benchmarks/compare_benchmarks.js baseline.json current.json --format markdown
+   ```
+
+5. **Generate HTML visualization:**
+   ```bash
+   python3 benchmarks/generate_html_report.py current.json --baseline baseline.json -o report.html
+   ```
+   
+   The HTML report includes:
+   - Interactive bar charts for execution times
+   - Line charts showing metric distributions
+   - Baseline vs current comparison charts
+   - Detailed statistics tables
+   - Automatic regression/improvement highlighting
+
+### Comparison Tool Options
+
+Both Python and Node.js versions support:
+
+- `--format`: Output format (text, csv, json, markdown)
+- `--threshold`: Regression threshold percentage (default: 5.0)
+- `--output`: Output file (default: stdout)
+- `--sort`: Sort by name, improvement, or regression
+
+### HTML Report Options
+
+- `--output`: Output HTML file (default: benchmark_report.html)
+- `--title`: Custom report title
+- `--baseline`: Baseline JSON file for comparison
+- `--theme`: Color theme (light or dark)
 
 ## Advanced Usage
 
@@ -259,18 +307,67 @@ For production profiling (more accurate, slower):
 
 ### Integration with CI/CD
 
-Example GitHub Actions workflow snippet:
+Example GitHub Actions workflow snippet with automated comparison:
+
 ```yaml
-- name: Run performance benchmarks
+- name: Checkout main branch for baseline
   run: |
-    ./build.sh perf -- --runs 10 --report json > perf-results.json
+    git fetch origin main
+    git checkout origin/main
     
-- name: Upload results
+- name: Build and run baseline benchmarks
+  run: |
+    ./build.sh perf -- --runs 10 --report json > baseline.json
+    
+- name: Checkout current branch
+  run: |
+    git checkout ${{ github.sha }}
+    
+- name: Build and run current benchmarks
+  run: |
+    ./build.sh perf -- --runs 10 --report json > current.json
+    
+- name: Compare results and generate reports
+  run: |
+    # Generate comparison in multiple formats
+    python3 benchmarks/compare_benchmarks.py baseline.json current.json --format markdown > comparison.md
+    python3 benchmarks/compare_benchmarks.py baseline.json current.json --format json > comparison.json
+    
+    # Generate HTML visualization
+    python3 benchmarks/generate_html_report.py current.json --baseline baseline.json -o report.html
+    
+- name: Upload artifacts
   uses: actions/upload-artifact@v3
   with:
     name: performance-results
-    path: perf-results.json
+    path: |
+      baseline.json
+      current.json
+      comparison.md
+      comparison.json
+      report.html
+      
+- name: Comment comparison on PR (optional)
+  if: github.event_name == 'pull_request'
+  uses: actions/github-script@v6
+  with:
+    script: |
+      const fs = require('fs');
+      const comparison = fs.readFileSync('comparison.md', 'utf8');
+      github.rest.issues.createComment({
+        issue_number: context.issue.number,
+        owner: context.repo.owner,
+        repo: context.repo.repo,
+        body: `## Performance Comparison\n\n${comparison}`
+      });
 ```
+
+This workflow:
+1. Runs benchmarks on both baseline (main branch) and current code
+2. Generates comparison reports in multiple formats
+3. Creates an interactive HTML visualization
+4. Uploads all artifacts for review
+5. Optionally posts comparison results as a PR comment
 
 ## Understanding the Metrics
 
