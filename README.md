@@ -75,6 +75,8 @@ For comprehensive performance testing and analysis, see the
 - Detailed benchmark methodology and options
 - Performance characteristics for all operations
 - Report generation in multiple formats (text, CSV, JSON, markdown)
+- **Automated comparison tools** for baseline vs current results (Python/Node.js)
+- **HTML visualization reports** with interactive charts
 - Optimization guidelines and best practices
 - Regression testing procedures
 
@@ -88,6 +90,11 @@ Quick performance testing:
 
 # Generate markdown report for specific benchmarks
 ./generate-perf-report.sh --filter parse --format markdown
+
+# Compare with baseline and visualize
+./build/json_perf --runs 10 --report json > current.json
+python3 benchmarks/compare_benchmarks.py baseline.json current.json
+python3 benchmarks/generate_html_report.py current.json --baseline baseline.json
 ```
 
 The `json_perf` binary exercises large synthetic corpora under
