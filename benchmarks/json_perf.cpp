@@ -117,13 +117,18 @@ ComputeStats(std::vector<double> samples)
     } else {
         stats.median_ns = samples[samples.size() / 2];
     }
-    // Calculate percentiles
-    std::size_t p95_idx = static_cast<std::size_t>(samples.size() * 0.95);
-    std::size_t p99_idx = static_cast<std::size_t>(samples.size() * 0.99);
-    if (p95_idx >= samples.size()) p95_idx = samples.size() - 1;
-    if (p99_idx >= samples.size()) p99_idx = samples.size() - 1;
-    stats.p95_ns = samples[p95_idx];
-    stats.p99_ns = samples[p99_idx];
+    // Calculate percentiles with proper interpolation for small sample sizes
+    // For small samples (< 20), percentiles may equal max value
+    if (samples.size() >= 20) {
+        std::size_t p95_idx = static_cast<std::size_t>((samples.size() - 1) * 0.95);
+        std::size_t p99_idx = static_cast<std::size_t>((samples.size() - 1) * 0.99);
+        stats.p95_ns = samples[p95_idx];
+        stats.p99_ns = samples[p99_idx];
+    } else {
+        // For small sample sizes, use max as conservative estimate
+        stats.p95_ns = stats.max_ns;
+        stats.p99_ns = stats.max_ns;
+    }
     return stats;
 }
 
@@ -170,8 +175,13 @@ PrintCSVReport(const std::vector<BenchResult>& results)
 {
     std::printf("benchmark,mean_ns,median_ns,min_ns,max_ns,stddev_ns,p95_ns,p99_ns,iterations,bytes_per_iter,throughput_mb_s\n");
     for (const auto& r : results) {
+        // Sanitize benchmark name by replacing commas with semicolons to avoid CSV issues
+        std::string safe_name = r.name;
+        for (std::size_t i = 0; i < safe_name.size(); ++i) {
+            if (safe_name[i] == ',') safe_name[i] = ';';
+        }
         std::printf("%s,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%zu,%zu,%.2f\n",
-                    r.name.c_str(),
+                    safe_name.c_str(),
                     r.stats.mean_ns,
                     r.stats.median_ns,
                     r.stats.min_ns,

@@ -141,11 +141,23 @@ mkdir -p "$OUTPUT_DIR"
 # Check if benchmark binary exists
 if [ ! -f "$PERF_BIN" ]; then
     print_error "Benchmark binary not found: $PERF_BIN"
+    
+    # Check if build.sh exists
+    if [ ! -f "$SCRIPT_DIR/build.sh" ]; then
+        print_error "Build script not found: $SCRIPT_DIR/build.sh"
+        print_info "Please build the project manually with CMake:"
+        print_info "  cmake -B build && cmake --build build --target json_perf"
+        exit 1
+    fi
+    
     print_info "Building benchmarks..."
     cd "$SCRIPT_DIR"
-    ./build.sh perf --no-test
-    if [ ! -f "$PERF_BIN" ]; then
+    if ! ./build.sh perf --no-test; then
         print_error "Failed to build benchmark binary"
+        exit 1
+    fi
+    if [ ! -f "$PERF_BIN" ]; then
+        print_error "Benchmark binary still not found after build"
         exit 1
     fi
 fi
@@ -227,10 +239,17 @@ if [ -n "$COMPARE_FILE" ]; then
     CURRENT_FILE="${OUTPUT_DIR}/current-${TIMESTAMP}.json"
     $PERF_BIN $COMMON_ARGS --report json > "$CURRENT_FILE"
     
-    # Simple comparison (could be enhanced with a Python/Node script)
     print_info "Current results saved to: $CURRENT_FILE"
-    print_warn "Automatic comparison not yet implemented"
-    print_info "Please manually compare $COMPARE_FILE with $CURRENT_FILE"
+    print_info "Baseline results: $COMPARE_FILE"
+    echo ""
+    print_warn "Automated comparison requires a comparison tool."
+    print_info "You can compare the files manually or use tools like:"
+    print_info "  - jq for JSON diffing"
+    print_info "  - Python script with pandas for detailed analysis"
+    print_info "  - Online JSON diff tools"
+    echo ""
+    print_info "Example manual comparison:"
+    print_info "  diff <(jq -S . $COMPARE_FILE) <(jq -S . $CURRENT_FILE)"
 fi
 
 echo ""
