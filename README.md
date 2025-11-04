@@ -69,12 +69,32 @@ than 3x) advantage, which we haven't figured out how to explain yet.
       16617 ns 2000x json_test_suite()
 ```
 
-For broader coverage, the `json_perf` binary exercises large synthetic
-corpora under `benchmarks/corpus/`, the JSONTestSuite valid/invalid
-cases, and several JSONPath query/update scenarios while reporting
-latency and throughput stats. Build it with `cmake --build build --target
-json_perf` and run `./build/json_perf --runs 5 --warmup 1` to collect the
-extended performance snapshot.
+For comprehensive performance testing and analysis, see the
+[Performance Guide](PERFORMANCE.md) which includes:
+
+- Detailed benchmark methodology and options
+- Performance characteristics for all operations
+- Report generation in multiple formats (text, CSV, JSON, markdown)
+- Optimization guidelines and best practices
+- Regression testing procedures
+
+Quick performance testing:
+```bash
+# Run all benchmarks
+./build.sh perf
+
+# Generate comprehensive reports
+./generate-perf-report.sh --runs 10
+
+# Generate markdown report for specific benchmarks
+./generate-perf-report.sh --filter parse --format markdown
+```
+
+The `json_perf` binary exercises large synthetic corpora under
+`benchmarks/corpus/`, the JSONTestSuite valid/invalid cases, and several
+JSONPath query/update scenarios while reporting detailed latency and
+throughput statistics. Build it with `cmake --build build --target
+json_perf` and run with various options (see `--help`).
 
 ## Usage Example
 

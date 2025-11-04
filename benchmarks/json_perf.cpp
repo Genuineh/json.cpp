@@ -32,6 +32,8 @@ struct Stats
     double mean_ns;
     double median_ns;
     double stddev_ns;
+    double p95_ns;
+    double p99_ns;
 };
 
 struct BenchConfig
@@ -41,6 +43,8 @@ struct BenchConfig
     double scale = 1.0;
     std::string filter;
     bool list_only = false;
+    bool generate_report = false;
+    std::string report_format = "text"; // text, csv, json, markdown
 };
 
 struct BenchCase
@@ -50,6 +54,15 @@ struct BenchCase
     std::size_t bytes_per_iteration;
     std::function<void(std::size_t)> prepare;
     std::function<void()> body;
+};
+
+struct BenchResult
+{
+    std::string name;
+    Stats stats;
+    std::size_t iterations;
+    std::size_t bytes_per_iteration;
+    double throughput_mb_s;
 };
 
 static volatile std::uint64_t g_sink = 0;
@@ -104,6 +117,13 @@ ComputeStats(std::vector<double> samples)
     } else {
         stats.median_ns = samples[samples.size() / 2];
     }
+    // Calculate percentiles
+    std::size_t p95_idx = static_cast<std::size_t>(samples.size() * 0.95);
+    std::size_t p99_idx = static_cast<std::size_t>(samples.size() * 0.99);
+    if (p95_idx >= samples.size()) p95_idx = samples.size() - 1;
+    if (p99_idx >= samples.size()) p99_idx = samples.size() - 1;
+    stats.p95_ns = samples[p95_idx];
+    stats.p99_ns = samples[p99_idx];
     return stats;
 }
 
@@ -120,6 +140,115 @@ ClampIterations(std::size_t base, double scale)
     return static_cast<std::size_t>(scaled);
 }
 
+inline void
+PrintTextReport(const std::vector<BenchResult>& results, const BenchConfig& config)
+{
+    std::printf("\n=== Performance Benchmark Report ===\n");
+    std::printf("Configuration: warmup=%zu runs=%zu scale=%.2f\n\n",
+                config.warmup_runs, config.measure_runs, config.scale);
+    
+    for (const auto& r : results) {
+        std::printf("%-32s %10.2f ns/op  (median %.2f | min %.2f | max %.2f | stddev %.2f | p95 %.2f | p99 %.2f)  iter=%-6zu",
+                    r.name.c_str(),
+                    r.stats.mean_ns,
+                    r.stats.median_ns,
+                    r.stats.min_ns,
+                    r.stats.max_ns,
+                    r.stats.stddev_ns,
+                    r.stats.p95_ns,
+                    r.stats.p99_ns,
+                    r.iterations);
+        if (r.throughput_mb_s > 0.0) {
+            std::printf("  throughput=%.2f MB/s", r.throughput_mb_s);
+        }
+        std::printf("\n");
+    }
+}
+
+inline void
+PrintCSVReport(const std::vector<BenchResult>& results)
+{
+    std::printf("benchmark,mean_ns,median_ns,min_ns,max_ns,stddev_ns,p95_ns,p99_ns,iterations,bytes_per_iter,throughput_mb_s\n");
+    for (const auto& r : results) {
+        std::printf("%s,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%zu,%zu,%.2f\n",
+                    r.name.c_str(),
+                    r.stats.mean_ns,
+                    r.stats.median_ns,
+                    r.stats.min_ns,
+                    r.stats.max_ns,
+                    r.stats.stddev_ns,
+                    r.stats.p95_ns,
+                    r.stats.p99_ns,
+                    r.iterations,
+                    r.bytes_per_iteration,
+                    r.throughput_mb_s);
+    }
+}
+
+inline void
+PrintJSONReport(const std::vector<BenchResult>& results, const BenchConfig& config)
+{
+    std::printf("{\n");
+    std::printf("  \"config\": {\n");
+    std::printf("    \"warmup_runs\": %zu,\n", config.warmup_runs);
+    std::printf("    \"measure_runs\": %zu,\n", config.measure_runs);
+    std::printf("    \"scale\": %.2f\n", config.scale);
+    std::printf("  },\n");
+    std::printf("  \"results\": [\n");
+    for (std::size_t i = 0; i < results.size(); ++i) {
+        const auto& r = results[i];
+        std::printf("    {\n");
+        std::printf("      \"name\": \"%s\",\n", r.name.c_str());
+        std::printf("      \"mean_ns\": %.2f,\n", r.stats.mean_ns);
+        std::printf("      \"median_ns\": %.2f,\n", r.stats.median_ns);
+        std::printf("      \"min_ns\": %.2f,\n", r.stats.min_ns);
+        std::printf("      \"max_ns\": %.2f,\n", r.stats.max_ns);
+        std::printf("      \"stddev_ns\": %.2f,\n", r.stats.stddev_ns);
+        std::printf("      \"p95_ns\": %.2f,\n", r.stats.p95_ns);
+        std::printf("      \"p99_ns\": %.2f,\n", r.stats.p99_ns);
+        std::printf("      \"iterations\": %zu,\n", r.iterations);
+        std::printf("      \"bytes_per_iteration\": %zu,\n", r.bytes_per_iteration);
+        std::printf("      \"throughput_mb_s\": %.2f\n", r.throughput_mb_s);
+        std::printf("    }%s\n", (i < results.size() - 1) ? "," : "");
+    }
+    std::printf("  ]\n");
+    std::printf("}\n");
+}
+
+inline void
+PrintMarkdownReport(const std::vector<BenchResult>& results, const BenchConfig& config)
+{
+    std::printf("# Performance Benchmark Report\n\n");
+    std::printf("## Configuration\n\n");
+    std::printf("- Warmup runs: %zu\n", config.warmup_runs);
+    std::printf("- Measurement runs: %zu\n", config.measure_runs);
+    std::printf("- Scale factor: %.2f\n\n", config.scale);
+    
+    std::printf("## Results\n\n");
+    std::printf("| Benchmark | Mean (ns) | Median (ns) | Min (ns) | Max (ns) | StdDev (ns) | P95 (ns) | P99 (ns) | Throughput (MB/s) |\n");
+    std::printf("|-----------|-----------|-------------|----------|----------|-------------|----------|----------|-------------------|\n");
+    
+    for (const auto& r : results) {
+        std::printf("| %s | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f | ",
+                    r.name.c_str(),
+                    r.stats.mean_ns,
+                    r.stats.median_ns,
+                    r.stats.min_ns,
+                    r.stats.max_ns,
+                    r.stats.stddev_ns,
+                    r.stats.p95_ns,
+                    r.stats.p99_ns);
+        if (r.throughput_mb_s > 0.0) {
+            std::printf("%.2f", r.throughput_mb_s);
+        } else {
+            std::printf("N/A");
+        }
+        std::printf(" |\n");
+    }
+    std::printf("\n");
+}
+
+
 class Runner
 {
   public:
@@ -127,7 +256,7 @@ class Runner
     {
     }
 
-    void run(const BenchCase& bench_case) const
+    void run(const BenchCase& bench_case)
     {
         if (!config_.filter.empty() &&
             bench_case.name.find(config_.filter) == std::string::npos) {
@@ -178,23 +307,39 @@ class Runner
             throughput_mb_s = (bench_case.bytes_per_iteration * 1e3) / stats.median_ns;
         }
 
-        std::printf("%-32s %10.2f ns/op  (median %.2f | min %.2f | max %.2f | stddev %.2f)  inner=%-6zu",
-                    bench_case.name.c_str(),
-                    stats.mean_ns,
-                    stats.median_ns,
-                    stats.min_ns,
-                    stats.max_ns,
-                    stats.stddev_ns,
-                    inner);
-        if (throughput_mb_s > 0.0) {
-            std::printf("  throughput=%.2f MB/s",
-                        throughput_mb_s);
+        BenchResult result;
+        result.name = bench_case.name;
+        result.stats = stats;
+        result.iterations = inner;
+        result.bytes_per_iteration = bench_case.bytes_per_iteration;
+        result.throughput_mb_s = throughput_mb_s;
+        results_.push_back(result);
+
+        if (!config_.generate_report) {
+            std::printf("%-32s %10.2f ns/op  (median %.2f | min %.2f | max %.2f | stddev %.2f)  inner=%-6zu",
+                        bench_case.name.c_str(),
+                        stats.mean_ns,
+                        stats.median_ns,
+                        stats.min_ns,
+                        stats.max_ns,
+                        stats.stddev_ns,
+                        inner);
+            if (throughput_mb_s > 0.0) {
+                std::printf("  throughput=%.2f MB/s",
+                            throughput_mb_s);
+            }
+            std::printf("\n");
         }
-        std::printf("\n");
+    }
+
+    const std::vector<BenchResult>& getResults() const
+    {
+        return results_;
     }
 
   private:
     BenchConfig config_;
+    std::vector<BenchResult> results_;
 };
 
 inline std::string
@@ -265,11 +410,12 @@ ParseArgs(int argc, char** argv)
         std::string arg(argv[i]);
         if (arg == "--help" || arg == "-h") {
             std::printf("json_perf options:\n");
-            std::printf("  --warmup N     Number of warmup runs (default 1)\n");
-            std::printf("  --runs N       Number of measured runs (default 5)\n");
-            std::printf("  --scale X      Scale inner iteration counts by X\n");
-            std::printf("  --filter STR   Only run benchmarks containing STR\n");
-            std::printf("  --list         List benchmark names\n");
+            std::printf("  --warmup N       Number of warmup runs (default 1)\n");
+            std::printf("  --runs N         Number of measured runs (default 5)\n");
+            std::printf("  --scale X        Scale inner iteration counts by X\n");
+            std::printf("  --filter STR     Only run benchmarks containing STR\n");
+            std::printf("  --list           List benchmark names\n");
+            std::printf("  --report FORMAT  Generate report (text, csv, json, markdown)\n");
             std::exit(0);
         } else if (HasPrefix(arg, "--warmup=")) {
             config.warmup_runs = static_cast<std::size_t>(std::strtoul(arg.c_str() + 9, NULL, 10));
@@ -279,6 +425,9 @@ ParseArgs(int argc, char** argv)
             config.scale = std::atof(arg.c_str() + 8);
         } else if (HasPrefix(arg, "--filter=")) {
             config.filter = arg.substr(9);
+        } else if (HasPrefix(arg, "--report=")) {
+            config.generate_report = true;
+            config.report_format = arg.substr(9);
         } else if (arg == "--warmup") {
             Ensure(i + 1 < argc, "--warmup requires an argument");
             config.warmup_runs = static_cast<std::size_t>(std::strtoul(argv[++i], NULL, 10));
@@ -293,6 +442,10 @@ ParseArgs(int argc, char** argv)
             config.filter = argv[++i];
         } else if (arg == "--list") {
             config.list_only = true;
+        } else if (arg == "--report") {
+            Ensure(i + 1 < argc, "--report requires an argument");
+            config.generate_report = true;
+            config.report_format = argv[++i];
         } else {
             Ensure(false, std::string("unknown argument: ") + arg);
         }
@@ -590,6 +743,149 @@ main(int argc, char** argv)
                           g_sink += out.size();
                       } });
 
+    // Additional comprehensive benchmarks
+    cases.push_back({ "construct.empty_object",
+                      10000,
+                      0,
+                      std::function<void(std::size_t)>(),
+                      [&]() {
+                          jt::Json obj;
+                          obj["key"] = "value";
+                          DoNotOptimize(obj);
+                          g_sink += obj.isObject();
+                      } });
+
+    cases.push_back({ "construct.nested_object",
+                      5000,
+                      0,
+                      std::function<void(std::size_t)>(),
+                      [&]() {
+                          jt::Json obj;
+                          obj["a"]["b"]["c"]["d"] = 42;
+                          DoNotOptimize(obj);
+                          g_sink += obj.isObject();
+                      } });
+
+    cases.push_back({ "construct.array_integers",
+                      3000,
+                      0,
+                      std::function<void(std::size_t)>(),
+                      [&]() {
+                          jt::Json arr;
+                          for (int i = 0; i < 10; ++i) {
+                              arr[i] = i * 100;
+                          }
+                          DoNotOptimize(arr);
+                          g_sink += arr.isArray();
+                      } });
+
+    cases.push_back({ "access.deep_nested",
+                      5000,
+                      0,
+                      std::function<void(std::size_t)>(),
+                      [&]() {
+                          std::pair<jt::Json::Status, jt::Json> parsed =
+                            jt::Json::parse(R"({"a":{"b":{"c":{"d":"value"}}}})");
+                          Ensure(parsed.first == jt::Json::success,
+                                 "access.deep_nested parse failed");
+                          const jt::Json& val = parsed.second["a"]["b"]["c"]["d"];
+                          DoNotOptimize(val);
+                          g_sink += val.isString();
+                      } });
+
+    cases.push_back({ "access.array_iteration",
+                      2000,
+                      0,
+                      std::function<void(std::size_t)>(),
+                      [&]() {
+                          std::vector<jt::Json>& arr = medium_orders_json.getArray();
+                          std::size_t count = 0;
+                          for (const auto& item : arr) {
+                              count += item.isObject();
+                          }
+                          g_sink += count;
+                      } });
+
+    cases.push_back({ "parse.deeply_nested",
+                      100,
+                      0,
+                      std::function<void(std::size_t)>(),
+                      [&]() {
+                          std::string deep = "{";
+                          for (int i = 0; i < 15; ++i) {
+                              deep += "\"a\":{";
+                          }
+                          deep += "\"value\":42";
+                          for (int i = 0; i < 15; ++i) {
+                              deep += "}";
+                          }
+                          deep += "}";
+                          std::pair<jt::Json::Status, jt::Json> parsed =
+                            jt::Json::parse(deep);
+                          Ensure(parsed.first == jt::Json::success,
+                                 "parse.deeply_nested failed");
+                          g_sink += parsed.second.isObject();
+                      } });
+
+    cases.push_back({ "parse.number_array",
+                      1000,
+                      0,
+                      std::function<void(std::size_t)>(),
+                      [&]() {
+                          std::string numbers = "[";
+                          for (int i = 0; i < 100; ++i) {
+                              if (i > 0) numbers += ",";
+                              numbers += std::to_string(i * 3.14159);
+                          }
+                          numbers += "]";
+                          std::pair<jt::Json::Status, jt::Json> parsed =
+                            jt::Json::parse(numbers);
+                          Ensure(parsed.first == jt::Json::success,
+                                 "parse.number_array failed");
+                          g_sink += parsed.second.isArray();
+                      } });
+
+    cases.push_back({ "parse.string_array",
+                      800,
+                      0,
+                      std::function<void(std::size_t)>(),
+                      [&]() {
+                          std::string strings = "[";
+                          for (int i = 0; i < 50; ++i) {
+                              if (i > 0) strings += ",";
+                              strings += "\"string_value_" + std::to_string(i) + "\"";
+                          }
+                          strings += "]";
+                          std::pair<jt::Json::Status, jt::Json> parsed =
+                            jt::Json::parse(strings);
+                          Ensure(parsed.first == jt::Json::success,
+                                 "parse.string_array failed");
+                          g_sink += parsed.second.isArray();
+                      } });
+
+    cases.push_back({ "stringify.escape_heavy",
+                      1000,
+                      0,
+                      std::function<void(std::size_t)>(),
+                      [&]() {
+                          jt::Json obj;
+                          obj["text"] = "Line 1\nLine 2\tTabbed\r\nQuote: \"Hello\"\\Path";
+                          std::string out = obj.toString();
+                          DoNotOptimize(out);
+                          g_sink += out.size();
+                      } });
+
+    cases.push_back({ "copy.medium_object",
+                      500,
+                      0,
+                      std::function<void(std::size_t)>(),
+                      [&]() {
+                          jt::Json copied = medium_orders_json;
+                          DoNotOptimize(copied);
+                          g_sink += copied.isArray();
+                      } });
+
+
     if (config.list_only) {
         for (std::size_t i = 0; i < cases.size(); ++i) {
             Runner(config).run(cases[i]);
@@ -597,17 +893,32 @@ main(int argc, char** argv)
         return 0;
     }
 
-    std::printf("json_perf: warmup=%zu runs=%zu scale=%.2f\n",
-                config.warmup_runs,
-                config.measure_runs,
-                config.scale);
+    if (!config.generate_report) {
+        std::printf("json_perf: warmup=%zu runs=%zu scale=%.2f\n",
+                    config.warmup_runs,
+                    config.measure_runs,
+                    config.scale);
+    }
 
     Runner runner(config);
     for (std::size_t i = 0; i < cases.size(); ++i) {
         runner.run(cases[i]);
     }
 
-    std::printf("sink=%llu\n", static_cast<unsigned long long>(g_sink));
+    if (config.generate_report) {
+        const std::vector<BenchResult>& results = runner.getResults();
+        if (config.report_format == "csv") {
+            PrintCSVReport(results);
+        } else if (config.report_format == "json") {
+            PrintJSONReport(results, config);
+        } else if (config.report_format == "markdown" || config.report_format == "md") {
+            PrintMarkdownReport(results, config);
+        } else {
+            PrintTextReport(results, config);
+        }
+    } else {
+        std::printf("sink=%llu\n", static_cast<unsigned long long>(g_sink));
+    }
 
     return 0;
 }
