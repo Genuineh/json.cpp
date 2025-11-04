@@ -8,6 +8,9 @@
 /.aarch64
 /build
 
+# Performance reports
+/perf-reports/
+
 # Example build artifacts
 example/*.o
 example/*.a
